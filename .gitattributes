@@ -1,0 +1,17 @@
+# Normalise every text file to LF, both in the repository and in the working tree.
+# Git for Windows ships with core.autocrlf=true at system scope, which checks files
+# out as CRLF and breaks `prettier --check` (.prettierrc.json pins endOfLine: "lf").
+# Attributes win over core.autocrlf, so this makes checkouts byte-identical on every OS.
+* text=auto eol=lf
+
+# Windows batch files only run correctly with CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Belt and braces: text=auto already detects these, but never risk mangling them.
+*.avro binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary

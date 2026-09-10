@@ -1,0 +1,114 @@
+name: kafka-order-pipeline
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:8.3.1
+    container_name: kop-kafka
+    hostname: kafka
+    ports:
+      - '9092:9092'
+    environment:
+      # --- KRaft: broker + controller in one node, no ZooKeeper ---
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      # Two listeners: PLAINTEXT for in-network containers, PLAINTEXT_HOST for your machine.
+      # Getting advertised.listeners wrong is the #1 cause of "connects then hangs".
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      # --- single-node sizing ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Explicit topics only — a typo must fail loudly, not create a ghost topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ['CMD', 'kafka-broker-api-versions', '--bootstrap-server', 'localhost:9092']
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:8.3.1
+    container_name: kop-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ['/bin/bash', '-c']
+    command: |
+      set -euo pipefail
+      echo "--- creating topics ---"
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic orders --partitions 3 --replication-factor 1 \
+        --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic orders.retry.5s --partitions 3 --replication-factor 1 \
+        --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic orders.retry.30s --partitions 3 --replication-factor 1 \
+        --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic orders.retry.5m --partitions 3 --replication-factor 1 \
+        --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic orders.dlq --partitions 1 --replication-factor 1 \
+        --config retention.ms=-1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic orders.aggregate.state --partitions 3 --replication-factor 1 \
+        --config cleanup.policy=compact
+      echo "--- topics present ---"
+      kafka-topics --bootstrap-server kafka:29092 --list
+    restart: 'no'
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:8.3.1
+    container_name: kop-schema-registry
+    hostname: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - '8081:8081'
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: 'http://0.0.0.0:8081'
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: 'backward'
+    healthcheck:
+      # cp-schema-registry 8.x ships no curl/wget/nc; python3 is the only HTTP client in the image.
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:8081/subjects", timeout=5)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: kop-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - '8080:8080'
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'kafka:29092'
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: 'http://schema-registry:8081'
+      DYNAMIC_CONFIG_ENABLED: 'true'
+
+volumes:
+  kafka-data:

@@ -111,7 +111,12 @@ export {
 
 // --- Phase 6: chaos markers, retry metadata ---
 
-export { TRANSIENT_FAIL_PRODUCT } from './chaos.js';
+export {
+  POISON_FLAVOURS,
+  TRANSIENT_FAIL_PRODUCT,
+  createPoisonPayload,
+  type PoisonFlavour,
+} from './chaos.js';
 export {
   escalate,
   readRetryMetadata,

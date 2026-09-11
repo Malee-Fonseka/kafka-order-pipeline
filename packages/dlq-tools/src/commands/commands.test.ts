@@ -81,17 +81,21 @@ function deadLetter(
 const POISON = Buffer.from('{"not":"avro"}');
 
 describe('list', () => {
-  const letters = [
-    deadLetter(
-      '0',
-      POISON,
-      new PermanentError('deserialization', 'expected magic byte 0x00, found 0x7b'),
-    ),
-    deadLetter('1', Buffer.from([0, 0, 0, 0, 1]), new TransientError('downstream down'), 4),
-  ];
+  const poisonLetter = deadLetter(
+    '0',
+    POISON,
+    new PermanentError('deserialization', 'expected magic byte 0x00, found 0x7b'),
+  );
+  const exhaustedLetter = deadLetter(
+    '1',
+    Buffer.from([0, 0, 0, 0, 1]),
+    new TransientError('downstream down'),
+    4,
+  );
+  const letters = [poisonLetter, exhaustedLetter];
 
   it('summarises each dead letter in one row', () => {
-    const row = toListRow(letters[0] as DeadLetter);
+    const row = toListRow(poisonLetter);
 
     expect(row).toMatchObject({
       offset: '0',
@@ -270,8 +274,6 @@ describe('replay', () => {
           ]);
         },
       ),
-    } as unknown as Pick<Producer, 'send'> & {
-      sent: { topic: string; key: unknown; value: unknown; headers: Record<string, unknown> }[];
     };
   }
 

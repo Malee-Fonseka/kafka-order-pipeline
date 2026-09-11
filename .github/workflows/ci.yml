@@ -35,3 +35,30 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+  integration:
+    name: Integration tests (testcontainers)
+    runs-on: ubuntu-latest
+    # Docker is available on the hosted Ubuntu runners; testcontainers uses it
+    # directly. Kept as a separate job so a broker-level failure is visible as
+    # such, and so the fast quality job is never held up by container pulls.
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Integration tests against Kafka and Schema Registry
+        run: npm run test:integration
+        env:
+          # Container pulls dominate the first run; the suite itself is ~30 s.
+          TESTCONTAINERS_RYUK_DISABLED: 'false'

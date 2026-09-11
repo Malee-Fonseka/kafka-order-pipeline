@@ -31,16 +31,19 @@
     "infra:down": "docker compose down",
     "infra:reset": "docker compose down -v && docker compose up -d",
     "infra:logs": "docker compose logs -f",
-    "dlq": "node --env-file=.env packages/dlq-tools/dist/index.js"
+    "dlq": "node --env-file=.env packages/dlq-tools/dist/index.js",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",
+    "@testcontainers/kafka": "^12.1.0",
     "@types/node": "^22.9.0",
     "@types/ws": "^8.18.1",
     "eslint": "^9.14.0",
     "eslint-config-prettier": "^9.1.0",
     "pino-pretty": "^11.3.0",
     "prettier": "^3.3.3",
+    "testcontainers": "^12.1.0",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "typescript-eslint": "^8.13.0",

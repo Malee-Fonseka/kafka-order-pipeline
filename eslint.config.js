@@ -13,7 +13,11 @@ export default defineConfig(
       parserOptions: {
         projectService: {
           // Root tooling files belong to no build project; type them via tsconfig.eslint.json.
-          allowDefaultProject: ['eslint.config.js', 'vitest.config.ts'],
+          allowDefaultProject: [
+            'eslint.config.js',
+            'vitest.config.ts',
+            'vitest.integration.config.ts',
+          ],
           defaultProject: 'tsconfig.eslint.json',
         },
         tsconfigRootDir: import.meta.dirname,

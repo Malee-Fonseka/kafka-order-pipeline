@@ -1,4 +1,4 @@
-import { Counter, Gauge, Registry, collectDefaultMetrics } from 'prom-client';
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 
 import type { ProductEntry } from '../aggregation/aggregator.js';
 import type { RuntimeStats } from './stats.js';
@@ -6,15 +6,34 @@ import type { RuntimeStats } from './stats.js';
 /**
  * Prometheus metrics for `GET /metrics`.
  *
- * Phase 5 exposes what already exists as counters and gauges; Phase 8 adds
- * histograms (processing latency, commit latency) and the retry-tier
- * counters. A private registry rather than the global default keeps tests
- * isolated — two servers in one process must not share a registry.
+ * Counters for every terminal outcome and every tier, gauges for the
+ * aggregate and the group's position, histograms for the latencies an
+ * operator would alert on. A private registry rather than the global default
+ * keeps tests isolated — two servers in one process must not share a
+ * registry.
+ *
+ * Bucket choices: processing and commit are single-digit milliseconds to low
+ * seconds (stage 1 retries add up to 2 s); end-to-end latency includes retry
+ * tiers, so it stretches to minutes.
  */
+
+const FAST_BUCKETS = [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5];
+const END_TO_END_BUCKETS = [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600];
 
 export interface Metrics {
   readonly registry: Registry;
   recordOutcome: (outcome: 'processed' | 'retried' | 'dead-lettered' | 'forwarded') => void;
+  /** Detail counters: which tier a retry went to, which kind of dead letter. */
+  recordRetried: (tier: string) => void;
+  recordForwarded: (tier: string) => void;
+  recordDeadLettered: (errorType: string) => void;
+  recordPause: () => void;
+  /** Latencies, in seconds. */
+  observeProcessing: (outcome: string, seconds: number) => void;
+  observeCommit: (seconds: number) => void;
+  observeChangelogWrite: (seconds: number) => void;
+  /** Broker timestamp of the record to the moment it was processed. */
+  observeEndToEnd: (seconds: number) => void;
   recordCommit: () => void;
   recordFailure: () => void;
   recordAggregate: (entry: ProductEntry) => void;
@@ -44,6 +63,62 @@ export function createMetrics(): Metrics {
   const failed = new Counter({
     name: 'orders_failed_total',
     help: 'Records whose handler threw an unclassified error (not committed; redelivered).',
+    registers: [registry],
+  });
+
+  const retried = new Counter({
+    name: 'orders_retried_total',
+    help: 'Records republished to a retry tier, by tier.',
+    labelNames: ['tier'] as const,
+    registers: [registry],
+  });
+
+  const forwarded = new Counter({
+    name: 'retry_forwarded_total',
+    help: 'Due retry-tier records forwarded back to the main topic, by tier.',
+    labelNames: ['tier'] as const,
+    registers: [registry],
+  });
+
+  const deadLettered = new Counter({
+    name: 'orders_dead_lettered_total',
+    help: 'Records written to the DLQ, by error type (permanent, transient-exhausted).',
+    labelNames: ['error_type'] as const,
+    registers: [registry],
+  });
+
+  const pauses = new Counter({
+    name: 'retry_partition_pauses_total',
+    help: 'Times the delay gate paused a retry-tier partition rather than sleeping.',
+    registers: [registry],
+  });
+
+  const processing = new Histogram({
+    name: 'order_processing_duration_seconds',
+    help: 'Handler time per record, from delivery to terminal outcome, by outcome.',
+    labelNames: ['outcome'] as const,
+    buckets: FAST_BUCKETS,
+    registers: [registry],
+  });
+
+  const commit = new Histogram({
+    name: 'offset_commit_duration_seconds',
+    help: 'Round trip for one manual offset commit.',
+    buckets: FAST_BUCKETS,
+    registers: [registry],
+  });
+
+  const changelog = new Histogram({
+    name: 'changelog_write_duration_seconds',
+    help: 'Round trip for one aggregation changelog write (acks=all).',
+    buckets: FAST_BUCKETS,
+    registers: [registry],
+  });
+
+  const endToEnd = new Histogram({
+    name: 'order_end_to_end_latency_seconds',
+    help: 'Broker timestamp of the record to the moment it was processed; includes retry tiers.',
+    buckets: END_TO_END_BUCKETS,
     registers: [registry],
   });
 
@@ -91,6 +166,30 @@ export function createMetrics(): Metrics {
     registry,
     recordOutcome(outcome) {
       consumed.inc({ outcome });
+    },
+    recordRetried(tier) {
+      retried.inc({ tier });
+    },
+    recordForwarded(tier) {
+      forwarded.inc({ tier });
+    },
+    recordDeadLettered(errorType) {
+      deadLettered.inc({ error_type: errorType });
+    },
+    recordPause() {
+      pauses.inc();
+    },
+    observeProcessing(outcome, seconds) {
+      processing.observe({ outcome }, seconds);
+    },
+    observeCommit(seconds) {
+      commit.observe(seconds);
+    },
+    observeChangelogWrite(seconds) {
+      changelog.observe(seconds);
+    },
+    observeEndToEnd(seconds) {
+      endToEnd.observe(seconds);
     },
     recordCommit() {
       committed.inc();

@@ -8,7 +8,11 @@ import { z } from 'zod';
  * (Appendix B), so a producer-only deployment is never asked for a group id.
  */
 
-/** A port from the environment; blank falls back rather than coercing to 0. */
+/**
+ * A port from the environment; blank falls back rather than coercing to 0.
+ * An explicit 0 is allowed and means "any free port" — the integration suite
+ * runs several consumers on one machine and cannot know a free number ahead.
+ */
 function portEnv(fallback: number): z.ZodType<number, z.ZodTypeDef, unknown> {
   return z
     .unknown()
@@ -17,7 +21,7 @@ function portEnv(fallback: number): z.ZodType<number, z.ZodTypeDef, unknown> {
         ? fallback
         : Number(raw),
     )
-    .pipe(z.number().int('must be an integer').min(1).max(65_535));
+    .pipe(z.number().int('must be an integer').min(0).max(65_535));
 }
 
 function millisEnv(fallback: number): z.ZodType<number, z.ZodTypeDef, unknown> {

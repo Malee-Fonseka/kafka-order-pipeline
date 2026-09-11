@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-10
 - **Phase:** 2
-- **Relates to:** §2.5, §4 of `TODO.md` (project specification)
+- **Relates to:** §2.5 and §4 in [`ARCHITECTURE.md`](../ARCHITECTURE.md#appendix--numbered-principles-referenced-by-the-code-and-the-adrs)
 
 ## Context
 

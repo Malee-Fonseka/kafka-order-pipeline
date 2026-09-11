@@ -7,6 +7,34 @@ import { z } from 'zod';
  * Extends the shared base schema rather than adding consumer concerns to it
  * (Appendix B), so a producer-only deployment is never asked for a group id.
  */
+
+/**
+ * A port from the environment; blank falls back rather than coercing to 0.
+ * An explicit 0 is allowed and means "any free port" — the integration suite
+ * runs several consumers on one machine and cannot know a free number ahead.
+ */
+function portEnv(fallback: number): z.ZodType<number, z.ZodTypeDef, unknown> {
+  return z
+    .unknown()
+    .transform((raw) =>
+      raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')
+        ? fallback
+        : Number(raw),
+    )
+    .pipe(z.number().int('must be an integer').min(0).max(65_535));
+}
+
+function millisEnv(fallback: number): z.ZodType<number, z.ZodTypeDef, unknown> {
+  return z
+    .unknown()
+    .transform((raw) =>
+      raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')
+        ? fallback
+        : Number(raw),
+    )
+    .pipe(z.number().int('must be an integer').positive('must be greater than zero'));
+}
+
 export const consumerEnvSchema = baseEnvSchema.extend({
   /**
    * The consumer group. Every instance sharing this id splits the partitions
@@ -24,6 +52,43 @@ export const consumerEnvSchema = baseEnvSchema.extend({
    * the production-typical choice.
    */
   CONSUMER_AUTO_OFFSET_RESET: z.enum(['earliest', 'latest']).default('earliest'),
+
+  /** REST + WebSocket + dashboard. A second instance on one machine needs a different port. */
+  CONSUMER_API_PORT: portEnv(3000),
+  CONSUMER_API_HOST: z.string().min(1).default('127.0.0.1'),
+
+  /** How often lag and topic depths are sampled from the broker for the dashboard. */
+  CONSUMER_STATS_INTERVAL_MS: millisEnv(2_000),
+
+  /**
+   * Stage 1 of the retry strategy (D5): in-place attempts and the elapsed
+   * budget that bounds them. The budget is what keeps the handler well inside
+   * max.poll.interval.ms; the defaults are the D5 figures.
+   */
+  CONSUMER_RETRY_INPLACE_ATTEMPTS: z
+    .unknown()
+    .transform((raw) =>
+      raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')
+        ? 3
+        : Number(raw),
+    )
+    .pipe(z.number().int().min(1).max(10)),
+  CONSUMER_RETRY_INPLACE_BUDGET_MS: millisEnv(2_000),
+
+  /**
+   * Chaos (D8): the delivery on which the __TRANSIENT_FAIL__ marker succeeds.
+   * 2 = fails once and recovers from the 5s tier; 4 = rides every tier and
+   * succeeds after the 5m one; 5 or more = exhausted, which is how the DLQ
+   * path is demonstrated for transient errors.
+   */
+  CONSUMER_CHAOS_TRANSIENT_SUCCEED_AFTER: z
+    .unknown()
+    .transform((raw) =>
+      raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')
+        ? 2
+        : Number(raw),
+    )
+    .pipe(z.number().int().min(1)),
 });
 
 export type ConsumerEnv = z.infer<typeof consumerEnvSchema>;

@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Order Pipeline</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --page: #f9f9f7;
+        --surface: #fcfcfb;
+        --ink: #0b0b0b;
+        --ink-2: #52514e;
+        --muted: #898781;
+        --hairline: #e1e0d9;
+        --baseline: #c3c2b7;
+        --good: #0ca30c;
+        --warning: #fab219;
+        --critical: #d03b3b;
+        --radius: 6px;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page: #0d0d0d;
+          --surface: #1a1a19;
+          --ink: #ffffff;
+          --ink-2: #c3c2b7;
+          --muted: #898781;
+          --hairline: #2c2c2a;
+          --baseline: #383835;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--page);
+        color: var(--ink);
+        font:
+          14px/1.45 system-ui,
+          -apple-system,
+          'Segoe UI',
+          Roboto,
+          sans-serif;
+      }
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px 20px 48px;
+      }
+      header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 20px;
+      }
+      h1 {
+        font-size: 18px;
+        font-weight: 600;
+        margin: 0;
+      }
+      .meta {
+        color: var(--ink-2);
+        font-size: 13px;
+      }
+      .meta code {
+        font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+        font-size: 12px;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--ink-2);
+      }
+      .status .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .status[data-state='open'] .dot {
+        background: var(--good);
+      }
+      .status[data-state='closed'] .dot {
+        background: var(--critical);
+      }
+      .status[data-state='connecting'] .dot {
+        background: var(--warning);
+      }
+
+      .hero {
+        background: var(--surface);
+        border: 1px solid var(--hairline);
+        border-radius: var(--radius);
+        padding: 20px 24px;
+        margin-bottom: 16px;
+      }
+      .hero .label {
+        color: var(--ink-2);
+        margin-bottom: 4px;
+      }
+      .hero .value {
+        font-size: 52px;
+        font-weight: 600;
+        line-height: 1.05;
+        letter-spacing: -0.01em;
+      }
+      .hero .sub {
+        color: var(--muted);
+        margin-top: 6px;
+      }
+
+      .tiles {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+      .tile {
+        background: var(--surface);
+        border: 1px solid var(--hairline);
+        border-radius: var(--radius);
+        padding: 14px 16px;
+      }
+      .tile .label {
+        color: var(--ink-2);
+        font-size: 13px;
+        margin-bottom: 4px;
+      }
+      .tile .value {
+        font-size: 24px;
+        font-weight: 600;
+        line-height: 1.15;
+      }
+      .tile .value small {
+        font-size: 13px;
+        font-weight: 400;
+        color: var(--muted);
+        margin-left: 4px;
+      }
+      .tile .sub {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 4px;
+      }
+
+      section h2 {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--ink-2);
+        margin: 0 0 8px;
+      }
+      .table-wrap {
+        overflow-x: auto;
+        background: var(--surface);
+        border: 1px solid var(--hairline);
+        border-radius: var(--radius);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-variant-numeric: tabular-nums;
+      }
+      th,
+      td {
+        padding: 9px 14px;
+        text-align: right;
+        white-space: nowrap;
+        border-bottom: 1px solid var(--hairline);
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      th {
+        font-weight: 500;
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.02em;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      td.product {
+        font-weight: 500;
+      }
+      td.dim {
+        color: var(--muted);
+      }
+      .empty {
+        color: var(--muted);
+        padding: 20px 14px;
+        text-align: center;
+      }
+      .marker {
+        color: var(--warning);
+        font-size: 11px;
+        margin-left: 6px;
+      }
+      footer {
+        margin-top: 20px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      footer .error {
+        color: var(--critical);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Order pipeline</h1>
+          <div class="meta">
+            group <code id="group">…</code> · instance <code id="instance">…</code> · partitions
+            <code id="partitions">…</code>
+          </div>
+        </div>
+        <div class="status" id="status" data-state="connecting">
+          <span class="dot" aria-hidden="true"></span><span id="status-text">Connecting</span>
+        </div>
+      </header>
+
+      <div class="hero">
+        <div class="label">Global running average price</div>
+        <div class="value" id="global-mean">—</div>
+        <div class="sub" id="global-sub">no orders aggregated yet</div>
+      </div>
+
+      <div class="tiles">
+        <div class="tile">
+          <div class="label">Throughput</div>
+          <div class="value"><span id="throughput">0</span><small>msg/s</small></div>
+          <div class="sub">10 s window</div>
+        </div>
+        <div class="tile">
+          <div class="label">Consumer lag</div>
+          <div class="value" id="lag">—</div>
+          <div class="sub" id="lag-sub">records behind</div>
+        </div>
+        <div class="tile">
+          <div class="label">Dead letter queue</div>
+          <div class="value" id="dlq">0</div>
+          <div class="sub">records, never expire</div>
+        </div>
+        <div class="tile">
+          <div class="label">Retry · 5s</div>
+          <div class="value" id="retry-5s">0</div>
+          <div class="sub">tier 1</div>
+        </div>
+        <div class="tile">
+          <div class="label">Retry · 30s</div>
+          <div class="value" id="retry-30s">0</div>
+          <div class="sub">tier 2</div>
+        </div>
+        <div class="tile">
+          <div class="label">Retry · 5m</div>
+          <div class="value" id="retry-5m">0</div>
+          <div class="sub">tier 3</div>
+        </div>
+        <div class="tile">
+          <div class="label">Processed</div>
+          <div class="value" id="processed">0</div>
+          <div class="sub">
+            <span id="dead-lettered">0</span> dead-lettered ·
+            <span id="committed">0</span> committed
+          </div>
+        </div>
+      </div>
+
+      <section>
+        <h2>Per-product running averages</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Product</th>
+                <th>Partition</th>
+                <th>Orders</th>
+                <th>Mean</th>
+                <th>Min</th>
+                <th>Max</th>
+                <th>Std dev</th>
+                <th>Last order</th>
+              </tr>
+            </thead>
+            <tbody id="products">
+              <tr>
+                <td class="empty" colspan="8">Waiting for orders…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <span id="sampled">stats not sampled yet</span>
+        <span class="error" id="sample-error"></span>
+      </footer>
+    </main>
+
+    <script>
+      (function () {
+        'use strict';
+
+        var $ = function (id) {
+          return document.getElementById(id);
+        };
+        var money = new Intl.NumberFormat(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        });
+        var whole = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+        var rate = new Intl.NumberFormat(undefined, {
+          minimumFractionDigits: 1,
+          maximumFractionDigits: 1,
+        });
+
+        function text(id, value) {
+          $(id).textContent = value;
+        }
+
+        function fmt(value, formatter) {
+          return value === null || value === undefined ? '—' : formatter.format(value);
+        }
+
+        function relative(iso) {
+          if (!iso) return '—';
+          var seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+          if (seconds < 5) return 'just now';
+          if (seconds < 60) return seconds + ' s ago';
+          if (seconds < 3600) return Math.round(seconds / 60) + ' min ago';
+          return new Date(iso).toLocaleTimeString();
+        }
+
+        function renderAggregates(agg) {
+          var g = agg.global;
+          text('global-mean', g.count ? money.format(g.mean) : '—');
+          text(
+            'global-sub',
+            g.count
+              ? whole.format(g.count) +
+                  ' orders · min ' +
+                  money.format(g.min) +
+                  ' · max ' +
+                  money.format(g.max) +
+                  ' · σ ' +
+                  fmt(g.stddev, money)
+              : 'no orders aggregated yet',
+          );
+          text('partitions', agg.ownedPartitions.length ? agg.ownedPartitions.join(', ') : 'none');
+
+          var body = $('products');
+          body.textContent = '';
+          if (!agg.products.length) {
+            var row = document.createElement('tr');
+            var cell = document.createElement('td');
+            cell.className = 'empty';
+            cell.colSpan = 8;
+            cell.textContent = 'No products owned by this instance yet';
+            row.appendChild(cell);
+            body.appendChild(row);
+            return;
+          }
+          agg.products.forEach(function (p) {
+            var tr = document.createElement('tr');
+            var cells = [
+              [p.product, 'product'],
+              [String(p.partition), 'dim'],
+              [whole.format(p.count), ''],
+              [money.format(p.mean), ''],
+              [fmt(p.min, money), ''],
+              [fmt(p.max, money), ''],
+              [fmt(p.stddev, money), ''],
+              [relative(p.lastUpdated), 'dim'],
+            ];
+            cells.forEach(function (c, i) {
+              var td = document.createElement('td');
+              td.className = c[1];
+              td.textContent = c[0];
+              if (i === 0 && p.product === '__TRANSIENT_FAIL__') {
+                var mark = document.createElement('span');
+                mark.className = 'marker';
+                mark.textContent = 'chaos marker';
+                td.appendChild(mark);
+              }
+              tr.appendChild(td);
+            });
+            body.appendChild(tr);
+          });
+        }
+
+        function renderStats(s) {
+          text('group', s.groupId);
+          text('instance', s.instanceId);
+          text('throughput', rate.format(s.throughputPerSecond));
+          text('lag', s.lag.total === null ? '—' : whole.format(s.lag.total));
+          text(
+            'lag-sub',
+            s.lag.partitions.length
+              ? s.lag.partitions
+                  .map(function (p) {
+                    return (
+                      'p' +
+                      p.partition +
+                      (p.owned ? '*' : '') +
+                      ' ' +
+                      (p.lag === null ? '—' : p.lag)
+                    );
+                  })
+                  .join(' · ')
+              : 'records behind',
+          );
+          text('dlq', whole.format(s.dlqDepth));
+          s.retryTiers.forEach(function (tier) {
+            var el = $('retry-' + tier.label);
+            if (el) el.textContent = whole.format(tier.depth);
+          });
+          text('processed', whole.format(s.counters.processed));
+          text('dead-lettered', whole.format(s.counters.deadLettered));
+          text('committed', whole.format(s.counters.committed));
+          text(
+            'sampled',
+            'stats sampled ' +
+              relative(s.sampledAt) +
+              ' · up ' +
+              whole.format(s.uptimeSeconds) +
+              ' s',
+          );
+          text('sample-error', s.sampleError ? ' · last sample failed: ' + s.sampleError : '');
+        }
+
+        function setStatus(state, label) {
+          $('status').dataset.state = state;
+          text('status-text', label);
+        }
+
+        var backoff = 500;
+        function connect() {
+          setStatus('connecting', 'Connecting');
+          var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+          var ws = new WebSocket(proto + location.host + '/ws');
+
+          ws.onopen = function () {
+            backoff = 500;
+            setStatus('open', 'Live');
+          };
+          ws.onmessage = function (event) {
+            var frame = JSON.parse(event.data);
+            if (frame.type === 'snapshot') {
+              renderAggregates(frame.aggregates);
+              renderStats(frame.stats);
+            } else if (frame.type === 'aggregates') {
+              renderAggregates(frame.aggregates);
+            } else if (frame.type === 'stats') {
+              renderStats(frame.stats);
+            }
+          };
+          ws.onclose = function () {
+            setStatus('closed', 'Disconnected — retrying');
+            setTimeout(connect, backoff);
+            backoff = Math.min(backoff * 2, 8000);
+          };
+          ws.onerror = function () {
+            ws.close();
+          };
+        }
+
+        connect();
+        // Relative timestamps in the table go stale without new frames.
+        setInterval(function () {
+          var cells = document.querySelectorAll('#products td:last-child');
+          if (!cells.length) return;
+          // Cheap refresh: ask the server for the current snapshot.
+          fetch('/aggregates')
+            .then(function (r) {
+              return r.json();
+            })
+            .then(renderAggregates)
+            .catch(function () {});
+        }, 15000);
+      })();
+    </script>
+  </body>
+</html>

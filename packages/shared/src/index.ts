@@ -23,6 +23,7 @@ export {
   isClassifiedError,
   isPermanent,
   isTransient,
+  classifyError,
   type ClassifiedError,
   type ErrorKind,
   type PermanentReason,
@@ -101,4 +102,47 @@ export {
   type KafkaClient,
   type KafkaClientOptions,
   type KafkaLogLevel,
+  createIdempotentProducer,
+  type Producer,
+  type ProducerOptions,
+  type RecordMetadata,
+  REBALANCE_EVENT_CODES,
 } from './kafka.js';
+
+// --- Phase 6: chaos markers, retry metadata ---
+
+export {
+  POISON_FLAVOURS,
+  TRANSIENT_FAIL_PRODUCT,
+  createPoisonPayload,
+  type PoisonFlavour,
+} from './chaos.js';
+export {
+  escalate,
+  readRetryMetadata,
+  retryHeaderValues,
+  type Escalation,
+  type RetryHeaderUpdate,
+  type RetryMetadata,
+} from './retry.js';
+export { scanTopic, type ScanResult, type ScanTopicOptions, type ScannedRecord } from './kafka.js';
+
+// --- Phase 7: dead letter queue ---
+
+export {
+  HEADERS_STRIPPED_ON_REPLAY,
+  MAX_STACK_HEADER_BYTES,
+  REPLAYED_AT_HEADER,
+  REPLAYED_FROM_OFFSET_HEADER,
+  REPLAY_COUNT_HEADER,
+  dlqErrorTypeFor,
+  dlqHeaderValues,
+  readDlqMetadata,
+  replayHeaders,
+  type DlqErrorType,
+  type DlqFailure,
+  type DlqMetadata,
+  type DlqSource,
+  type DlqWriterContext,
+  type ReplaySource,
+} from './dlq.js';

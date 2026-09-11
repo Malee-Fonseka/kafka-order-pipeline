@@ -28,7 +28,14 @@ export type PermanentReason =
   /** Wire-format schema ID is not present in the registry. */
   | 'unknown-schema-id'
   /** Decoded fine, but the value violates a business rule. */
-  | 'validation';
+  | 'validation'
+  /**
+   * Nothing recognised the error. Treated as permanent because an unknown
+   * failure is far more often a bug (deterministic) than an unrecognised
+   * network condition, and the DLQ has replay — so the record is parked with
+   * full forensics rather than cycled through six minutes of retry tiers.
+   */
+  | 'unclassified';
 
 export type ErrorKind = 'transient' | 'permanent';
 
@@ -116,4 +123,106 @@ export function describeError(error: unknown): string {
  */
 function toJson(value: unknown): string | undefined {
   return JSON.stringify(value);
+}
+
+/**
+ * Node system error codes that mean "the other side went away for a moment".
+ * Every one of these can succeed on a retry and none of them is a fact about
+ * the record being processed.
+ */
+const TRANSIENT_SYSTEM_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+/** HTTP statuses a downstream returns when it is the one having a bad day. */
+const TRANSIENT_HTTP_STATUSES: ReadonlySet<number> = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function readString(value: unknown, key: string): string | undefined {
+  if (typeof value !== 'object' || value === null || !(key in value)) {
+    return undefined;
+  }
+  const found = (value as Record<string, unknown>)[key];
+  return typeof found === 'string' ? found : undefined;
+}
+
+function readNumber(value: unknown, key: string): number | undefined {
+  if (typeof value !== 'object' || value === null || !(key in value)) {
+    return undefined;
+  }
+  const found = (value as Record<string, unknown>)[key];
+  return typeof found === 'number' ? found : undefined;
+}
+
+function readBoolean(value: unknown, key: string): boolean | undefined {
+  if (typeof value !== 'object' || value === null || !(key in value)) {
+    return undefined;
+  }
+  const found = (value as Record<string, unknown>)[key];
+  return typeof found === 'boolean' ? found : undefined;
+}
+
+/**
+ * The classification function (design decision D4).
+ *
+ * Every failure that escapes a handler passes through here exactly once
+ * before any retry or DLQ decision is taken. The rules, in order:
+ *
+ * 1. Already classified — returned unchanged. The code that raised it knew
+ *    best; this function never second-guesses a deliberate decision.
+ * 2. A Node system error with a connection-level code — transient.
+ * 3. An error carrying an HTTP status: 408/425/429/5xx — transient; any other
+ *    4xx is a fact about the request and therefore permanent.
+ * 4. A Kafka client error that declares itself `retriable` — transient.
+ * 5. A message that reads as a timeout — transient.
+ * 6. Anything else — permanent, reason `unclassified`. See that reason's
+ *    documentation for why the default leans this way.
+ *
+ * The rules are deliberately mechanical and the tests enumerate them: this is
+ * the single most reviewable function in the codebase, and it should be
+ * possible to point at the line that decided a record's fate.
+ */
+export function classifyError(error: unknown): ClassifiedError {
+  if (isClassifiedError(error)) {
+    return error;
+  }
+
+  const message = describeError(error);
+  const code = readString(error, 'code');
+
+  if (code !== undefined && TRANSIENT_SYSTEM_CODES.has(code)) {
+    return new TransientError(`${code}: ${message}`, { cause: error });
+  }
+
+  const status = readNumber(error, 'status') ?? readNumber(error, 'statusCode');
+  if (status !== undefined) {
+    if (TRANSIENT_HTTP_STATUSES.has(status)) {
+      return new TransientError(`HTTP ${String(status)}: ${message}`, { cause: error });
+    }
+    if (status >= 400 && status < 500) {
+      return new PermanentError('unclassified', `HTTP ${String(status)}: ${message}`, {
+        cause: error,
+      });
+    }
+  }
+
+  if (readBoolean(error, 'retriable') === true) {
+    return new TransientError(`retriable client error: ${message}`, { cause: error });
+  }
+
+  if (/\btime(d )?out\b/i.test(message)) {
+    return new TransientError(`timeout: ${message}`, { cause: error });
+  }
+
+  return new PermanentError('unclassified', message, { cause: error });
 }

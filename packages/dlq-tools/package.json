@@ -1,0 +1,21 @@
+{
+  "name": "@order-pipeline/dlq-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "dlq-inspector": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@confluentinc/kafka-javascript": "^1.10.1",
+    "@order-pipeline/shared": "*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@confluentinc/schemaregistry": "^1.10.1"
+  }
+}

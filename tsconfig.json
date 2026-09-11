@@ -1,8 +1,17 @@
 {
   "files": [],
   "references": [
-    { "path": "./packages/shared" },
-    { "path": "./packages/producer" },
-    { "path": "./packages/consumer" }
+    {
+      "path": "./packages/shared"
+    },
+    {
+      "path": "./packages/producer"
+    },
+    {
+      "path": "./packages/consumer"
+    },
+    {
+      "path": "./packages/dlq-tools"
+    }
   ]
 }

@@ -62,3 +62,31 @@ export {
   tryReadWireFormatHeader,
   type WireFormatHeader,
 } from './wire-format.js';
+
+// --- Phase 3: record headers, package metadata ---
+
+export {
+  APP_VERSION_HEADER,
+  ATTEMPT_COUNT_HEADER,
+  CONSUMER_GROUP_HEADER,
+  CORRELATION_ID_HEADER,
+  ERROR_CLASS_HEADER,
+  ERROR_MESSAGE_HEADER,
+  ERROR_STACK_HEADER,
+  ERROR_TYPE_HEADER,
+  FIRST_FAILED_AT_HEADER,
+  LAST_FAILED_AT_HEADER,
+  ORIGINAL_KEY_HEADER,
+  ORIGINAL_OFFSET_HEADER,
+  ORIGINAL_PARTITION_HEADER,
+  ORIGINAL_TIMESTAMP_HEADER,
+  ORIGINAL_TOPIC_HEADER,
+  RETRY_NOT_BEFORE_HEADER,
+  encodeHeaders,
+  readHeader,
+  readIntHeader,
+  type EncodedHeaders,
+  type HeaderMap,
+  type HeaderValue,
+} from './headers.js';
+export { readPackageVersion } from './version.js';

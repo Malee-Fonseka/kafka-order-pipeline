@@ -7,6 +7,20 @@ export interface ShutdownManager {
   register: (name: string, hook: ShutdownHook) => void;
   /** Blocks until a termination signal is received and all hooks have run. */
   wait: () => Promise<void>;
+  /**
+   * Starts the same shutdown sequence a signal would, from application code.
+   *
+   * Needed whenever a service finishes its work on its own terms rather than
+   * being interrupted — a producer that has emitted its configured message
+   * budget, or a CLI that has completed its command. Without this, such a
+   * process either exits with buffers unflushed or blocks forever in
+   * {@link ShutdownManager.wait} waiting for a signal that is never coming.
+   *
+   * Note that the returned promise does not resolve on the success path: the
+   * hook sequence ends in `process.exit`, exactly as it does for a signal.
+   * Treat a call to this as the last statement of the program.
+   */
+  trigger: (reason: string, exitCode?: number) => Promise<void>;
 }
 
 export interface ShutdownOptions {
@@ -85,5 +99,6 @@ export function createShutdownManager({
       hooks.push({ name, hook });
     },
     wait: () => waitPromise,
+    trigger: (reason, exitCode = 0) => runHooks(reason, exitCode),
   };
 }

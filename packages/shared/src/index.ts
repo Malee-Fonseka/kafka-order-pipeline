@@ -90,3 +90,15 @@ export {
   type HeaderValue,
 } from './headers.js';
 export { readPackageVersion } from './version.js';
+
+// --- Phase 4: kafka client bootstrap ---
+
+export {
+  createKafkaClient,
+  createKafkaLogger,
+  librdkafkaVersion,
+  toKafkaLogLevel,
+  type KafkaClient,
+  type KafkaClientOptions,
+  type KafkaLogLevel,
+} from './kafka.js';

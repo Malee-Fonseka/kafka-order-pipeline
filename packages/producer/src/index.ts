@@ -4,6 +4,7 @@ import {
   APP_VERSION_HEADER,
   CORRELATION_ID_HEADER,
   buildTopicRegistry,
+  createKafkaClient,
   createLogger,
   createOrderSerializer,
   createRegistryClient,
@@ -65,11 +66,12 @@ async function main(): Promise<void> {
   });
 
   const serializer = createOrderSerializer({ client: registry, topic: topics.orders });
-  const producer = await createOrderProducer({
+  const kafka = createKafkaClient({
     brokers: config.KAFKA_BROKERS,
     clientId: config.KAFKA_CLIENT_ID,
     logger,
   });
+  const producer = await createOrderProducer({ kafka, logger });
 
   const generator = createOrderGenerator({
     products: config.PRODUCER_PRODUCTS,

@@ -10,6 +10,8 @@
     "start": "node --env-file=../../.env dist/index.js"
   },
   "dependencies": {
-    "@order-pipeline/shared": "*"
+    "@confluentinc/kafka-javascript": "^1.10.1",
+    "@order-pipeline/shared": "*",
+    "zod": "^3.23.8"
   }
 }

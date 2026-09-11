@@ -1,9 +1,8 @@
 import {
-  baseEnvSchema,
   buildTopicRegistry,
+  createKafkaClient,
   createLogger,
   createOrderDeserializer,
-  createOrderSerializer,
   createRegistryClient,
   createShutdownManager,
   ensureOrderSchemaRegistered,
@@ -11,7 +10,12 @@ import {
   loadConfig,
 } from '@order-pipeline/shared';
 
-const config = loadConfig(baseEnvSchema);
+import { consumerEnvSchema } from './config.js';
+import { createOrderConsumer } from './kafka.js';
+import { type IncomingRecord, createPipeline } from './pipeline.js';
+import { type Outcome, createRecordProcessor } from './processor.js';
+
+const config = loadConfig(consumerEnvSchema);
 
 const logger = createLogger({
   service: 'consumer',
@@ -27,53 +31,92 @@ async function main(): Promise<void> {
     {
       brokers: config.KAFKA_BROKERS,
       schemaRegistry: config.SCHEMA_REGISTRY_URL,
+      groupId: config.CONSUMER_GROUP_ID,
       sourceTopic: topics.orders,
-      retryTopics: topics.retryTiers.map((tier) => tier.topic),
-      dlqTopic: topics.dlq,
+      autoOffsetReset: config.CONSUMER_AUTO_OFFSET_RESET,
     },
     'consumer starting',
   );
+
+  // --- dependencies, registered for shutdown in dependency order ---
+  // Hooks run in reverse, so the consumer (registered last) drains and
+  // disconnects first, while the registry client it decodes through is still
+  // open.
 
   const registry = createRegistryClient({ url: config.SCHEMA_REGISTRY_URL });
   shutdown.register('schema-registry-client', () => {
     registry.close();
   });
 
-  // The consumer registers the schema too. It does not strictly need to — it
-  // decodes by the schema ID on the wire — but doing so means the stack is
-  // usable whichever service a grader happens to start first (ADR 007).
   const registration = await ensureOrderSchemaRegistered({
     client: registry,
     topic: topics.orders,
     logger,
   });
 
-  // Constructed at boot so the schema fetch and its cache are warm before the
-  // first record arrives, rather than paying a registry round trip inside the
-  // first message handler.
   const deserializer = createOrderDeserializer({ client: registry, topic: topics.orders });
 
-  // Boot-time self check: encode and decode one record against the live
-  // registry. A schema mismatch between this consumer and the registry is
-  // otherwise invisible until the first real message fails — and by then the
-  // failure looks like a poison pill rather than a deployment problem.
-  // Phase 4 replaces this with the real Kafka message loop.
-  const probe = await createOrderSerializer({ client: registry, topic: topics.orders }).serialize({
-    orderId: 'bootstrap-probe',
-    product: 'Item1',
-    price: 0,
+  const kafka = createKafkaClient({
+    brokers: config.KAFKA_BROKERS,
+    clientId: config.KAFKA_CLIENT_ID,
+    logger,
   });
-  const decoded = await deserializer.deserialize(probe);
+
+  const consumer = await createOrderConsumer({
+    kafka,
+    groupId: config.CONSUMER_GROUP_ID,
+    autoOffsetReset: config.CONSUMER_AUTO_OFFSET_RESET,
+    logger,
+  });
+
+  const pipeline = createPipeline<Outcome>({
+    process: createRecordProcessor({ deserializer, logger }),
+    commit: async (position) => {
+      await consumer.commitOffsets([position]);
+      logger.debug(position, 'offset committed');
+    },
+  });
+
+  const tally = { processed: 0, skipped: 0 };
+
+  shutdown.register('kafka-consumer', async () => {
+    // Order matters and each step protects the next:
+    //  1. drain — let the record currently inside eachMessage finish and
+    //     commit. Disconnecting first would drop that commit on the floor.
+    //  2. disconnect — leaves the group cleanly, so the broker reassigns our
+    //     partitions immediately instead of waiting out sessionTimeout.
+    logger.info({ inFlight: pipeline.inFlight, ...tally }, 'draining in-flight records');
+    await pipeline.drain();
+    await consumer.disconnect();
+    logger.info({ ...pipeline.stats, ...tally }, 'kafka consumer disconnected; offsets committed');
+  });
+
+  await consumer.subscribe({ topics: [topics.orders] });
 
   logger.info(
-    {
-      subject: registration.subject,
-      schemaId: registration.schemaId,
-      version: registration.version,
-      probe: decoded,
-    },
-    'avro deserializer ready; awaiting phase 4 kafka consumer',
+    { subject: registration.subject, schemaId: registration.schemaId, topic: topics.orders },
+    'consuming orders',
   );
+
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      const record: IncomingRecord = {
+        topic,
+        partition,
+        offset: message.offset,
+        timestamp: message.timestamp,
+        key: message.key,
+        value: message.value,
+        headers: message.headers,
+      };
+
+      // A rejection here is deliberate: the pipeline has already declined to
+      // commit, and throwing makes the client seek back and redeliver — the
+      // at-least-once behaviour for an unexpected failure.
+      const outcome = await pipeline.handle(record);
+      tally[outcome.kind] += 1;
+    },
+  });
 
   await shutdown.wait();
 }
@@ -81,7 +124,7 @@ async function main(): Promise<void> {
 main().catch((error: unknown) => {
   logger.fatal(
     { err: error, classified: isClassifiedError(error) ? error.kind : 'unclassified' },
-    'consumer failed to start',
+    'consumer failed',
   );
   process.exit(1);
 });

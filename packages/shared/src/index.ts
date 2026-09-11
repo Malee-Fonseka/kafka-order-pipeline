@@ -23,6 +23,7 @@ export {
   isClassifiedError,
   isPermanent,
   isTransient,
+  classifyError,
   type ClassifiedError,
   type ErrorKind,
   type PermanentReason,
@@ -107,3 +108,15 @@ export {
   type RecordMetadata,
   REBALANCE_EVENT_CODES,
 } from './kafka.js';
+
+// --- Phase 6: chaos markers, retry metadata ---
+
+export { TRANSIENT_FAIL_PRODUCT } from './chaos.js';
+export {
+  escalate,
+  readRetryMetadata,
+  retryHeaderValues,
+  type Escalation,
+  type RetryHeaderUpdate,
+  type RetryMetadata,
+} from './retry.js';

@@ -25,8 +25,9 @@ const stats: RuntimeStats = {
   groupId: 'order-consumers',
   uptimeSeconds: 12,
   throughputPerSecond: 4.5,
-  counters: { processed: 10, skipped: 1, committed: 11, failed: 0 },
+  counters: { processed: 10, skipped: 1, retried: 0, forwarded: 0, committed: 11, failed: 0 },
   ownedPartitions: [0, 2],
+  pausedPartitions: [],
   lag: {
     total: 3,
     partitions: [

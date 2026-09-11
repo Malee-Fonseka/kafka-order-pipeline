@@ -55,6 +55,36 @@ export const consumerEnvSchema = baseEnvSchema.extend({
 
   /** How often lag and topic depths are sampled from the broker for the dashboard. */
   CONSUMER_STATS_INTERVAL_MS: millisEnv(2_000),
+
+  /**
+   * Stage 1 of the retry strategy (D5): in-place attempts and the elapsed
+   * budget that bounds them. The budget is what keeps the handler well inside
+   * max.poll.interval.ms; the defaults are the D5 figures.
+   */
+  CONSUMER_RETRY_INPLACE_ATTEMPTS: z
+    .unknown()
+    .transform((raw) =>
+      raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')
+        ? 3
+        : Number(raw),
+    )
+    .pipe(z.number().int().min(1).max(10)),
+  CONSUMER_RETRY_INPLACE_BUDGET_MS: millisEnv(2_000),
+
+  /**
+   * Chaos (D8): the delivery on which the __TRANSIENT_FAIL__ marker succeeds.
+   * 2 = fails once and recovers from the 5s tier; 4 = rides every tier and
+   * succeeds after the 5m one; 5 or more = exhausted, which is how the DLQ
+   * path is demonstrated for transient errors.
+   */
+  CONSUMER_CHAOS_TRANSIENT_SUCCEED_AFTER: z
+    .unknown()
+    .transform((raw) =>
+      raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')
+        ? 2
+        : Number(raw),
+    )
+    .pipe(z.number().int().min(1)),
 });
 
 export type ConsumerEnv = z.infer<typeof consumerEnvSchema>;

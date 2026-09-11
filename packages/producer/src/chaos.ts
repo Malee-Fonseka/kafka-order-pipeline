@@ -1,4 +1,4 @@
-import { type Order, encodeWireFormatHeader } from '@order-pipeline/shared';
+import { type Order, TRANSIENT_FAIL_PRODUCT, encodeWireFormatHeader } from '@order-pipeline/shared';
 
 /**
  * Fault injection built into the producer (design decision D8).
@@ -19,14 +19,8 @@ import { type Order, encodeWireFormatHeader } from '@order-pipeline/shared';
  *   *permanently* and must reach the DLQ without ever entering a retry tier.
  */
 
-/**
- * Marker product that makes the consumer's handler fail transiently.
- *
- * Deliberately not a plausible product name: it must never collide with real
- * data, and a reader scanning a topic in Kafbat UI should be able to tell at a
- * glance that the record is synthetic.
- */
-export const TRANSIENT_FAIL_PRODUCT = '__TRANSIENT_FAIL__';
+/** Re-exported for the producer's own tests and callers; defined in shared. */
+export { TRANSIENT_FAIL_PRODUCT };
 
 /**
  * The ways a payload can be undecodable.

@@ -1,8 +1,11 @@
 import { MockClient, type Client } from '@confluentinc/schemaregistry';
 import {
+  ATTEMPT_COUNT_HEADER,
   CORRELATION_ID_HEADER,
   type Order,
+  type OrderDeserializer,
   TransientError,
+  buildTopicRegistry,
   createOrderDeserializer,
   createOrderSerializer,
   encodeHeaders,
@@ -11,13 +14,26 @@ import {
 } from '@order-pipeline/shared';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
+import type { OrderHandler } from './handler.js';
 import type { IncomingRecord } from './pipeline.js';
-import { createRecordProcessor } from './processor.js';
+import { createForwardProcessor, createRecordProcessor } from './processor.js';
+import type { BackoffOptions } from './retry/backoff.js';
+import type { RetryPublisher } from './retry/publisher.js';
 
 import type { Logger } from 'pino';
 
 const TOPIC = 'orders';
 const ORDER: Order = { orderId: '1001', product: 'Item1', price: 12.5 };
+const topics = buildTopicRegistry('orders');
+
+/** Instant backoff: no sleeping, deterministic bounds. */
+const backoff: BackoffOptions = {
+  maxAttempts: 3,
+  budgetMs: 2_000,
+  baseMs: 0,
+  capMs: 0,
+  sleep: async () => Promise.resolve(),
+};
 
 function fakeLogger(): Logger & { warn: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn> } {
   return {
@@ -26,6 +42,31 @@ function fakeLogger(): Logger & { warn: ReturnType<typeof vi.fn>; info: ReturnTy
     error: vi.fn(),
     debug: vi.fn(),
   } as unknown as Logger & { warn: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn> };
+}
+
+function fakePublisher(): RetryPublisher & {
+  escalate: ReturnType<typeof vi.fn>;
+  forward: ReturnType<typeof vi.fn>;
+} {
+  const tier = topics.retryTiers[0];
+  if (tier === undefined) {
+    throw new Error('no tiers');
+  }
+  return {
+    escalate: vi.fn(async () =>
+      Promise.resolve({ kind: 'retried' as const, tier, attempt: 1, notBefore: new Date() }),
+    ),
+    forward: vi.fn(async () => Promise.resolve()),
+    metadataOf: () => ({
+      attempt: 0,
+      notBefore: undefined,
+      firstFailedAt: undefined,
+      lastFailedAt: undefined,
+      originalTopic: undefined,
+      originalPartition: undefined,
+      originalOffset: undefined,
+    }),
+  };
 }
 
 function recordWith(value: Buffer | null, headers?: Record<string, Buffer>): IncomingRecord {
@@ -40,49 +81,136 @@ function recordWith(value: Buffer | null, headers?: Record<string, Buffer>): Inc
   };
 }
 
+const okHandler: OrderHandler = async () => Promise.resolve();
+
+/** `expect.objectContaining` is typed `any`; this keeps the call sites lint-clean. */
+function containing(shape: Record<string, unknown>): unknown {
+  return expect.objectContaining(shape) as unknown;
+}
+
 describe('record processor', () => {
   let client: Client;
   let validPayload: Buffer;
+  let deserializer: OrderDeserializer;
 
   beforeAll(async () => {
     client = new MockClient({ baseURLs: ['mock://registry'] });
-    await ensureOrderSchemaRegistered({
-      client,
-      topic: TOPIC,
-      logger: fakeLogger(),
-    });
+    await ensureOrderSchemaRegistered({ client, topic: TOPIC, logger: fakeLogger() });
     validPayload = await createOrderSerializer({ client, topic: TOPIC }).serialize(ORDER);
+    deserializer = createOrderDeserializer({ client, topic: TOPIC });
   });
 
-  it('decodes a valid record and reports it processed', async () => {
+  it('decodes, handles and reports a valid record processed on the first attempt', async () => {
+    const handler = vi.fn(okHandler);
     const logger = fakeLogger();
     const process = createRecordProcessor({
-      deserializer: createOrderDeserializer({ client, topic: TOPIC }),
+      deserializer,
+      handler,
+      publisher: fakePublisher(),
+      backoff,
       logger,
     });
 
     const outcome = await process(recordWith(validPayload));
 
-    expect(outcome.kind).toBe('processed');
-    if (outcome.kind === 'processed') {
-      expect(outcome.order).toEqual(ORDER);
-    }
+    expect(outcome).toMatchObject({ kind: 'processed', order: ORDER, delivery: 1, attempts: 1 });
+    expect(handler).toHaveBeenCalledWith(
+      ORDER,
+      containing({ delivery: 1, attempt: 1, source: containing({ partition: 1 }) }),
+    );
     expect(logger.info).toHaveBeenCalledWith(
-      expect.objectContaining({ orderId: '1001', partition: 1, offset: '42' }),
+      expect.objectContaining({ orderId: '1001' }),
       'order received',
     );
   });
 
-  it('carries the correlation id from the producer through to the outcome', async () => {
+  it('carries the correlation id and the delivery number from headers', async () => {
     const process = createRecordProcessor({
-      deserializer: createOrderDeserializer({ client, topic: TOPIC }),
+      deserializer,
+      handler: okHandler,
+      publisher: fakePublisher(),
+      backoff,
       logger: fakeLogger(),
     });
-    const headers = encodeHeaders({ [CORRELATION_ID_HEADER]: 'corr-123' });
+    const headers = encodeHeaders({
+      [CORRELATION_ID_HEADER]: 'corr-123',
+      [ATTEMPT_COUNT_HEADER]: 2,
+    });
 
     const outcome = await process(recordWith(validPayload, headers));
 
-    expect(outcome.correlationId).toBe('corr-123');
+    expect(outcome).toMatchObject({ kind: 'processed', correlationId: 'corr-123', delivery: 3 });
+  });
+
+  it('retries a transient handler failure in place and succeeds', async () => {
+    let calls = 0;
+    const handler: OrderHandler = async () => {
+      calls += 1;
+      await Promise.resolve();
+      if (calls < 3) {
+        throw new TransientError('blip');
+      }
+    };
+    const publisher = fakePublisher();
+    const process = createRecordProcessor({
+      deserializer,
+      handler,
+      publisher,
+      backoff,
+      logger: fakeLogger(),
+    });
+
+    const outcome = await process(recordWith(validPayload));
+
+    expect(outcome).toMatchObject({ kind: 'processed', attempts: 3 });
+    expect(publisher.escalate).not.toHaveBeenCalled();
+  });
+
+  it('escalates to a retry tier once in-place attempts are exhausted', async () => {
+    const handler: OrderHandler = async () => {
+      await Promise.resolve();
+      throw new TransientError('downstream down');
+    };
+    const publisher = fakePublisher();
+    const process = createRecordProcessor({
+      deserializer,
+      handler,
+      publisher,
+      backoff,
+      logger: fakeLogger(),
+    });
+
+    const outcome = await process(recordWith(validPayload));
+
+    expect(outcome).toMatchObject({ kind: 'retried', tier: { label: '5s' }, attempt: 1 });
+    expect(publisher.escalate).toHaveBeenCalledTimes(1);
+    expect(publisher.escalate).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: '42' }),
+      expect.any(TransientError),
+    );
+  });
+
+  it('reports exhaustion as a terminal outcome when no tier is left', async () => {
+    const handler: OrderHandler = async () => {
+      await Promise.resolve();
+      throw new TransientError('still down');
+    };
+    const publisher = fakePublisher();
+    publisher.escalate.mockResolvedValue({
+      kind: 'exhausted',
+      attempt: 4,
+      error: new TransientError('still down'),
+    });
+    const logger = fakeLogger();
+    const process = createRecordProcessor({ deserializer, handler, publisher, backoff, logger });
+
+    const outcome = await process(recordWith(validPayload));
+
+    expect(outcome).toMatchObject({ kind: 'exhausted', attempt: 4 });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringMatching(/tiers exhausted/),
+    );
   });
 
   it.each([
@@ -98,14 +226,17 @@ describe('record processor', () => {
       value: encodeWireFormatHeader(999_999, Buffer.from([0x02, 0x41])),
       reason: 'unknown-schema-id',
     },
-  ])('skips $label as a terminal outcome rather than throwing', async ({ value, reason }) => {
-    // Throwing would make the client seek back and redeliver the same bytes
-    // forever. A permanent failure must resolve so the pipeline commits past
-    // it — into the DLQ from Phase 7, skipped and counted until then.
-    const logger = fakeLogger();
+  ])('skips $label without retrying, in place or via tiers', async ({ value, reason }) => {
+    // Retrying a poison pill is the §2.3 livelock: no in-place attempts, no
+    // republish. Straight to a terminal outcome.
+    const handler = vi.fn(okHandler);
+    const publisher = fakePublisher();
     const process = createRecordProcessor({
-      deserializer: createOrderDeserializer({ client, topic: TOPIC }),
-      logger,
+      deserializer,
+      handler,
+      publisher,
+      backoff,
+      logger: fakeLogger(),
     });
 
     const outcome = await process(recordWith(value));
@@ -114,70 +245,85 @@ describe('record processor', () => {
     if (outcome.kind === 'skipped') {
       expect(outcome.error.reason).toBe(reason);
     }
-    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(handler).not.toHaveBeenCalled();
+    expect(publisher.escalate).not.toHaveBeenCalled();
   });
 
-  it('skips a record that decodes but fails validation', async () => {
-    const bad = await createOrderSerializer({ client, topic: TOPIC }).serialize({
-      ...ORDER,
-      price: -1,
-    });
+  it('treats a permanent handler failure as terminal immediately', async () => {
+    const handler: OrderHandler = async () => {
+      await Promise.resolve();
+      throw new Error('a bug nobody anticipated');
+    };
+    const publisher = fakePublisher();
     const process = createRecordProcessor({
-      deserializer: createOrderDeserializer({ client, topic: TOPIC }),
+      deserializer,
+      handler,
+      publisher,
+      backoff,
       logger: fakeLogger(),
     });
 
-    const outcome = await process(recordWith(bad));
+    const outcome = await process(recordWith(validPayload));
 
-    expect(outcome.kind).toBe('skipped');
-    if (outcome.kind === 'skipped') {
-      expect(outcome.error.reason).toBe('validation');
-    }
+    // Unclassified → permanent 'unclassified' → skipped, one attempt, no tiers.
+    expect(outcome).toMatchObject({ kind: 'skipped', error: { reason: 'unclassified' } });
+    expect(publisher.escalate).not.toHaveBeenCalled();
   });
 
-  it('lets a transient failure propagate so the record is redelivered', async () => {
-    // A registry outage mid-decode is not a fact about the record. Resolving
-    // "skipped" here would commit past a perfectly good order because the
-    // registry blinked — data loss dressed up as poison handling.
+  it('propagates a failed republish so the pipeline does not commit', async () => {
+    const handler: OrderHandler = async () => {
+      await Promise.resolve();
+      throw new TransientError('down');
+    };
+    const publisher = fakePublisher();
+    publisher.escalate.mockRejectedValue(
+      new TransientError('republish failed: broker unavailable'),
+    );
     const process = createRecordProcessor({
-      deserializer: {
-        deserialize: async () => {
-          await Promise.resolve();
-          throw new TransientError('registry unavailable');
-        },
-      },
+      deserializer,
+      handler,
+      publisher,
+      backoff,
       logger: fakeLogger(),
     });
 
     await expect(process(recordWith(validPayload))).rejects.toBeInstanceOf(TransientError);
   });
 
-  it('lets an unclassified failure propagate rather than guessing', async () => {
+  it('uses the original partition from headers as the aggregation source', async () => {
+    // A record forwarded back from a retry tier lands on the same partition,
+    // but the header is the explicit source of truth for ownership.
+    const handler = vi.fn(okHandler);
     const process = createRecordProcessor({
-      deserializer: {
-        deserialize: async () => {
-          await Promise.resolve();
-          throw new Error('something nobody anticipated');
-        },
-      },
+      deserializer,
+      handler,
+      publisher: fakePublisher(),
+      backoff,
       logger: fakeLogger(),
     });
+    const headers = encodeHeaders({ [ATTEMPT_COUNT_HEADER]: 1, 'x-original-partition': 2 });
 
-    await expect(process(recordWith(validPayload))).rejects.toThrow('something nobody anticipated');
+    await process({ ...recordWith(validPayload, headers), partition: 1 });
+
+    expect(handler).toHaveBeenCalledWith(
+      ORDER,
+      containing({ delivery: 2, source: containing({ partition: 2 }) }),
+    );
   });
+});
 
-  it('processes the transient-failure marker as an ordinary order in this phase', async () => {
-    // The marker is structurally valid; the handler that fails on it lands
-    // in Phase 6. Until then it must flow through, not be mistaken for poison.
-    const marker = await createOrderSerializer({ client, topic: TOPIC }).serialize({
-      ...ORDER,
-      product: '__TRANSIENT_FAIL__',
-    });
-    const process = createRecordProcessor({
-      deserializer: createOrderDeserializer({ client, topic: TOPIC }),
-      logger: fakeLogger(),
-    });
+describe('forward processor', () => {
+  it('forwards a due retry record and reports it terminal', async () => {
+    const publisher = fakePublisher();
+    const process = createForwardProcessor({ publisher });
+    const record: IncomingRecord = {
+      ...recordWith(Buffer.from([1, 2, 3]), encodeHeaders({ [ATTEMPT_COUNT_HEADER]: 2 })),
+      topic: 'orders.retry.30s',
+    };
 
-    await expect(process(recordWith(marker))).resolves.toMatchObject({ kind: 'processed' });
+    const outcome = await process(record);
+
+    expect(outcome).toMatchObject({ kind: 'forwarded', fromTopic: 'orders.retry.30s', attempt: 2 });
+    expect(publisher.forward).toHaveBeenCalledWith(record);
   });
 });

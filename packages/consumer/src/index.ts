@@ -2,6 +2,7 @@ import { hostname } from 'node:os';
 
 import {
   buildTopicRegistry,
+  createIdempotentProducer,
   createKafkaClient,
   createLogger,
   createOrderDeserializer,
@@ -18,9 +19,13 @@ import { createMetrics } from './api/metrics.js';
 import { type HealthReport, createApiServer } from './api/server.js';
 import { createStatsSampler, createThroughput } from './api/stats.js';
 import { consumerEnvSchema } from './config.js';
+import { createOrderHandler } from './handler.js';
 import { createOrderConsumer } from './kafka.js';
 import { type IncomingRecord, createPipeline } from './pipeline.js';
-import { type Outcome, createRecordProcessor } from './processor.js';
+import { type Outcome, createForwardProcessor, createRecordProcessor } from './processor.js';
+import { type BackoffOptions, DEFAULT_BACKOFF } from './retry/backoff.js';
+import { createDelayGate } from './retry/delay-gate.js';
+import { createRetryPublisher } from './retry/publisher.js';
 
 const config = loadConfig(consumerEnvSchema);
 
@@ -42,7 +47,13 @@ async function main(): Promise<void> {
       schemaRegistry: config.SCHEMA_REGISTRY_URL,
       groupId: config.CONSUMER_GROUP_ID,
       sourceTopic: topics.orders,
+      retryTopics: topics.retryTiers.map((t) => t.topic),
       stateTopic: topics.aggregateState,
+      inPlaceRetry: {
+        attempts: config.CONSUMER_RETRY_INPLACE_ATTEMPTS,
+        budgetMs: config.CONSUMER_RETRY_INPLACE_BUDGET_MS,
+      },
+      chaosTransientSucceedAfter: config.CONSUMER_CHAOS_TRANSIENT_SUCCEED_AFTER,
       autoOffsetReset: config.CONSUMER_AUTO_OFFSET_RESET,
       api: `${config.CONSUMER_API_HOST}:${String(config.CONSUMER_API_PORT)}`,
     },
@@ -93,33 +104,55 @@ async function main(): Promise<void> {
   // Observability (D9): counters, throughput, lag, topic depths, /metrics.
   const metrics = createMetrics();
   const throughput = createThroughput();
-  const tally = { processed: 0, skipped: 0 };
+  const tally: Record<Outcome['kind'], number> = {
+    processed: 0,
+    skipped: 0,
+    retried: 0,
+    exhausted: 0,
+    forwarded: 0,
+  };
 
-  // The message path: deserialize → aggregate → changelog → (pipeline) commit.
-  const process = createRecordProcessor({ deserializer, logger });
+  // Retry machinery (D5). One producer serves both the changelog and the
+  // retry republisher; both need the D2 guarantees and neither is hot.
+  const retryProducer = await createIdempotentProducer({ kafka, logger, purpose: 'retry-tiers' });
+  shutdown.register('retry-producer', async () => {
+    await retryProducer.flush({ timeout: 5_000 });
+    await retryProducer.disconnect();
+  });
+  const publisher = createRetryPublisher({ producer: retryProducer, topics, logger });
+  const delayGate = createDelayGate({ logger });
+  shutdown.register('retry-delay-gate', () => {
+    delayGate.close();
+  });
+
+  const backoff: BackoffOptions = {
+    ...DEFAULT_BACKOFF,
+    maxAttempts: config.CONSUMER_RETRY_INPLACE_ATTEMPTS,
+    budgetMs: config.CONSUMER_RETRY_INPLACE_BUDGET_MS,
+  };
+
+  // The message path for the main topic:
+  //   deserialize → handle (aggregate + changelog) → [stage 1 → stage 2] → commit
+  const handler = createOrderHandler({
+    aggregator,
+    stateStore,
+    chaos: { transientSucceedAfterDelivery: config.CONSUMER_CHAOS_TRANSIENT_SUCCEED_AFTER },
+    onProcessed: () => {
+      throughput.mark();
+    },
+  });
+  const processOrder = createRecordProcessor({ deserializer, handler, publisher, backoff, logger });
+
+  // The message path for a retry tier that is due: forward back to orders.
+  const processRetry = createForwardProcessor({ publisher });
+
+  const retryTopics = new Set(topics.retryTiers.map((tier) => tier.topic));
 
   const pipeline = createPipeline<Outcome>({
     process: async (record) => {
-      const outcome = await process(record);
-
-      if (outcome.kind === 'processed') {
-        // Write-ahead, in three steps that must stay in this order:
-        //   next  — compute the updated state without touching memory;
-        //   write — make it durable in the changelog;
-        //   apply — only now advance memory and notify the dashboard.
-        // The offset commits after all three. On restart the restored
-        // aggregate is therefore never behind the committed position, and a
-        // failed changelog write leaves memory untouched so the redelivery
-        // counts the order once (ADR 006).
-        const entry = aggregator.next(outcome.order, {
-          partition: record.partition,
-          offset: record.offset,
-          timestamp: Number(record.timestamp),
-        });
-        await stateStore.write(entry);
-        aggregator.apply(entry);
-        throughput.mark();
-      }
+      const outcome = retryTopics.has(record.topic)
+        ? await processRetry(record)
+        : await processOrder(record);
 
       metrics.recordOutcome(outcome.kind);
       tally[outcome.kind] += 1;
@@ -140,10 +173,13 @@ async function main(): Promise<void> {
     throughput,
     counters: () => ({
       processed: tally.processed,
-      skipped: tally.skipped,
+      skipped: tally.skipped + tally.exhausted,
+      retried: tally.retried,
+      forwarded: tally.forwarded,
       committed: pipeline.stats.committed,
       failed: pipeline.stats.failed,
     }),
+    pausedPartitions: () => delayGate.paused,
     ownedPartitions: () => aggregator.snapshot().ownedPartitions,
     intervalMs: config.CONSUMER_STATS_INTERVAL_MS,
   });
@@ -228,7 +264,11 @@ async function main(): Promise<void> {
     logger.info({ ...pipeline.stats, ...tally }, 'kafka consumer disconnected; offsets committed');
   });
 
-  await consumer.subscribe({ topics: [topics.orders] });
+  // One group, one subscription: the main topic and every retry tier. Pausing
+  // a retry partition stops fetching from it alone; heartbeats and the poll
+  // loop carry on for everything else, which is why a five-minute tier delay
+  // causes no rebalance.
+  await consumer.subscribe({ topics: [topics.orders, ...topics.retryTiers.map((t) => t.topic)] });
 
   logger.info(
     {
@@ -241,7 +281,8 @@ async function main(): Promise<void> {
   );
 
   await consumer.run({
-    eachMessage: async ({ topic, partition, message }) => {
+    eachMessage: async (payload) => {
+      const { topic, partition, message } = payload;
       const record: IncomingRecord = {
         topic,
         partition,
@@ -251,6 +292,23 @@ async function main(): Promise<void> {
         value: message.value,
         headers: message.headers,
       };
+
+      // A retry-tier record that is not yet due is held back by pausing its
+      // partition and seeking to it — never by sleeping here. Nothing is
+      // committed; the record is redelivered when the partition resumes.
+      if (retryTopics.has(topic)) {
+        const decision = delayGate.check(record, {
+          // The client binds pause to this partition already; wrapping it
+          // keeps the call site free of an unbound method reference.
+          pause: () => payload.pause(),
+          seek: (offset) => {
+            consumer.seek({ topic, partition, offset });
+          },
+        });
+        if (decision.kind === 'deferred') {
+          return;
+        }
+      }
 
       // A rejection here is deliberate: the pipeline has already declined to
       // commit, and throwing makes the client seek back and redeliver — the

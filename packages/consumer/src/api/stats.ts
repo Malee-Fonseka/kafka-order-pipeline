@@ -32,9 +32,13 @@ export interface RuntimeStats {
   readonly counters: {
     readonly processed: number;
     readonly skipped: number;
+    readonly retried: number;
+    readonly forwarded: number;
     readonly committed: number;
     readonly failed: number;
   };
+  /** Retry-tier partitions currently held back by the delay gate. */
+  readonly pausedPartitions: readonly string[];
   readonly ownedPartitions: readonly number[];
   readonly lag: {
     readonly total: number | null;
@@ -88,6 +92,7 @@ export interface StatsSamplerOptions {
   readonly throughput: Throughput;
   readonly counters: () => RuntimeStats['counters'];
   readonly ownedPartitions: () => readonly number[];
+  readonly pausedPartitions?: () => readonly string[];
   readonly intervalMs: number;
 }
 
@@ -109,6 +114,7 @@ export function createStatsSampler({
   throughput,
   counters,
   ownedPartitions,
+  pausedPartitions = () => [],
   intervalMs,
 }: StatsSamplerOptions): StatsSampler {
   const startedAt = Date.now();
@@ -134,6 +140,7 @@ export function createStatsSampler({
     throughputPerSecond: Number(throughput.perSecond().toFixed(2)),
     counters: counters(),
     ownedPartitions: ownedPartitions(),
+    pausedPartitions: pausedPartitions(),
     lag: lastLag,
     retryTiers: lastTiers,
     dlqDepth: lastDlq,

@@ -14,7 +14,7 @@ import type { RuntimeStats } from './stats.js';
 
 export interface Metrics {
   readonly registry: Registry;
-  recordOutcome: (outcome: 'processed' | 'skipped') => void;
+  recordOutcome: (outcome: 'processed' | 'skipped' | 'retried' | 'exhausted' | 'forwarded') => void;
   recordCommit: () => void;
   recordFailure: () => void;
   recordAggregate: (entry: ProductEntry) => void;
@@ -30,7 +30,7 @@ export function createMetrics(): Metrics {
 
   const consumed = new Counter({
     name: 'orders_consumed_total',
-    help: 'Records consumed from the orders topic, by terminal outcome.',
+    help: 'Records consumed, by terminal outcome (processed, skipped, retried, exhausted, forwarded).',
     labelNames: ['outcome'] as const,
     registers: [registry],
   });
@@ -75,6 +75,12 @@ export function createMetrics(): Metrics {
     registers: [registry],
   });
 
+  const pausedPartitions = new Gauge({
+    name: 'retry_partitions_paused',
+    help: 'Retry-tier partitions currently paused by the delay gate.',
+    registers: [registry],
+  });
+
   const throughput = new Gauge({
     name: 'consumer_throughput_per_second',
     help: 'Records processed per second over a sliding window.',
@@ -107,6 +113,7 @@ export function createMetrics(): Metrics {
         topicDepth.set({ topic: tier.topic }, tier.depth);
       }
       topicDepth.set({ topic: 'dlq' }, stats.dlqDepth);
+      pausedPartitions.set(stats.pausedPartitions.length);
     },
     forgetProduct(product) {
       priceMean.remove({ product });

@@ -1,4 +1,9 @@
-import { createKafkaLogger, librdkafkaVersion, toKafkaLogLevel } from '@order-pipeline/shared';
+import {
+  REBALANCE_EVENT_CODES,
+  createKafkaLogger,
+  librdkafkaVersion,
+  toKafkaLogLevel,
+} from '@order-pipeline/shared';
 
 import type { KafkaJS } from '@confluentinc/kafka-javascript';
 import type { KafkaClient, Logger } from '@order-pipeline/shared';
@@ -14,11 +19,38 @@ import type { KafkaClient, Logger } from '@order-pipeline/shared';
 export type Consumer = KafkaJS.Consumer;
 export type EachMessagePayload = KafkaJS.EachMessagePayload;
 
+export interface RebalanceEvent {
+  readonly kind: 'assign' | 'revoke';
+  /** Partitions of the subscribed topic involved in this event. */
+  readonly partitions: readonly number[];
+  /** True when the revoke is because the group considers this member dead. */
+  readonly lost: boolean;
+}
+
 export interface ConsumerOptions {
   readonly kafka: KafkaClient;
   readonly groupId: string;
+  readonly topic: string;
   readonly autoOffsetReset: 'earliest' | 'latest';
   readonly logger: Logger;
+  /**
+   * Awaited by the client *before* it applies the assignment, so work done
+   * here — restoring aggregation state for newly assigned partitions —
+   * completes before any record from those partitions is delivered.
+   */
+  readonly onRebalance?: (event: RebalanceEvent) => Promise<void>;
+}
+
+/** The shape librdkafka hands a `rebalance_cb`; only what is used is typed. */
+interface RawRebalanceError {
+  readonly code: number;
+}
+interface RawAssignment {
+  readonly topic: string;
+  readonly partition: number;
+}
+interface RawAssignmentFns {
+  readonly assignmentLost: () => boolean;
 }
 
 /**
@@ -53,9 +85,38 @@ const MAX_POLL_INTERVAL_MS = 300_000;
 export async function createOrderConsumer({
   kafka,
   groupId,
+  topic,
   autoOffsetReset,
   logger,
+  onRebalance,
 }: ConsumerOptions): Promise<Consumer> {
+  // Returning nothing keeps the client's default assign/unassign behaviour;
+  // the callback exists only to observe. Errors thrown here are swallowed by
+  // the client (logged, then default behaviour continues), so the handler
+  // must record its own failure rather than rely on propagation.
+  const rebalanceCallback = async (
+    error: RawRebalanceError,
+    assignment: readonly RawAssignment[],
+    fns: RawAssignmentFns,
+  ): Promise<void> => {
+    const kind =
+      error.code === REBALANCE_EVENT_CODES.assign
+        ? 'assign'
+        : error.code === REBALANCE_EVENT_CODES.revoke
+          ? 'revoke'
+          : undefined;
+    if (kind === undefined || onRebalance === undefined) {
+      return;
+    }
+
+    const partitions = assignment
+      .filter((a) => a.topic === topic)
+      .map((a) => a.partition)
+      .sort((a, b) => a - b);
+
+    await onRebalance({ kind, partitions, lost: fns.assignmentLost() });
+  };
+
   const consumer = kafka.consumer({
     kafkaJS: {
       groupId,
@@ -67,6 +128,8 @@ export async function createOrderConsumer({
       logger: createKafkaLogger(logger),
       logLevel: toKafkaLogLevel(logger.level),
     },
+    // A raw librdkafka option, outside the kafkaJS block.
+    rebalance_cb: rebalanceCallback,
   });
 
   await consumer.connect();

@@ -101,4 +101,9 @@ export {
   type KafkaClient,
   type KafkaClientOptions,
   type KafkaLogLevel,
+  createIdempotentProducer,
+  type Producer,
+  type ProducerOptions,
+  type RecordMetadata,
+  REBALANCE_EVENT_CODES,
 } from './kafka.js';

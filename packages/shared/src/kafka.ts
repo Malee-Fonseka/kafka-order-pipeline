@@ -101,3 +101,81 @@ export function createKafkaClient({ brokers, clientId, logger }: KafkaClientOpti
     },
   });
 }
+
+export type Producer = KafkaJS.Producer;
+export type RecordMetadata = KafkaJS.RecordMetadata;
+
+export interface ProducerOptions {
+  readonly kafka: KafkaClient;
+  readonly logger: Logger;
+  /** Appears in the connection log line; distinguishes the order producer from the changelog writer. */
+  readonly purpose: string;
+}
+
+/**
+ * Connects an idempotent producer (design decision D2).
+ *
+ * Every setting below is load-bearing, and the combination is what makes
+ * "at-least-once with no client-side duplicates" an honest claim:
+ *
+ * | Setting | Why |
+ * |---|---|
+ * | `idempotent: true` | The client retries internally on transient broker errors. Without idempotence those retries can silently write the same record twice; with it, the broker de-duplicates by producer id and sequence number. |
+ * | `acks: -1` (all) | No acknowledgement until every in-sync replica has the write. `acks: 1` would lose acknowledged records on a leader failover. |
+ * | `maxInFlightRequests: 5` | The highest value that still preserves ordering under idempotence. Above 5 the broker cannot guarantee sequence ordering; below it, throughput drops for no benefit. |
+ * | `retry` | Survives a broker restart without involving the retry topics, which exist for *message* failures, not transport failures. |
+ * | `allowAutoTopicCreation: false` | §10.4 — a typo'd topic must fail loudly. The broker also refuses, but failing in the client is a clearer error. |
+ *
+ * Shared because every writer in the system — the order producer, the
+ * aggregation changelog, the retry republisher, the DLQ writer, the replay
+ * tool — needs exactly these guarantees. The idempotent producer is one line
+ * of configuration that most submissions omit; it is worth being able to
+ * explain in the viva.
+ */
+export async function createIdempotentProducer({
+  kafka,
+  logger,
+  purpose,
+}: ProducerOptions): Promise<Producer> {
+  const producer = kafka.producer({
+    kafkaJS: {
+      idempotent: true,
+      acks: -1,
+      maxInFlightRequests: 5,
+      allowAutoTopicCreation: false,
+      retry: {
+        retries: 10,
+        initialRetryTime: 100,
+        maxRetryTime: 30_000,
+      },
+      logger: createKafkaLogger(logger),
+      logLevel: toKafkaLogLevel(logger.level),
+    },
+  });
+
+  await producer.connect();
+  logger.info(
+    {
+      purpose,
+      idempotent: true,
+      acks: 'all',
+      maxInFlightRequests: 5,
+      librdkafka: librdkafkaVersion,
+    },
+    'kafka producer connected',
+  );
+
+  return producer;
+}
+
+/**
+ * librdkafka's rebalance event codes, for a `rebalance_cb`.
+ *
+ * The callback is a raw librdkafka option, not part of the KafkaJS-compatible
+ * surface, so the codes it reports come from the native layer. Named here so
+ * no service compares against a bare `-175`.
+ */
+export const REBALANCE_EVENT_CODES = {
+  assign: confluentKafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS,
+  revoke: confluentKafka.CODES.ERRORS.ERR__REVOKE_PARTITIONS,
+} as const;

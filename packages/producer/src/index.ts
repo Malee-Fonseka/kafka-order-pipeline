@@ -4,6 +4,7 @@ import {
   APP_VERSION_HEADER,
   CORRELATION_ID_HEADER,
   buildTopicRegistry,
+  createIdempotentProducer,
   createKafkaClient,
   createLogger,
   createOrderSerializer,
@@ -19,7 +20,6 @@ import {
 import { createChaosInjector } from './chaos.js';
 import { producerEnvSchema } from './config.js';
 import { createEmitter } from './emitter.js';
-import { createOrderProducer } from './kafka.js';
 import { createOrderGenerator } from './orders.js';
 
 const config = loadConfig(producerEnvSchema);
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
     clientId: config.KAFKA_CLIENT_ID,
     logger,
   });
-  const producer = await createOrderProducer({ kafka, logger });
+  const producer = await createIdempotentProducer({ kafka, logger, purpose: 'orders' });
 
   const generator = createOrderGenerator({
     products: config.PRODUCER_PRODUCTS,

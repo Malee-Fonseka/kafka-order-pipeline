@@ -43,29 +43,35 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ['/bin/bash', '-c']
-    command: |
-      set -euo pipefail
-      echo "--- creating topics ---"
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic orders --partitions 3 --replication-factor 1 \
-        --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic orders.retry.5s --partitions 3 --replication-factor 1 \
-        --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic orders.retry.30s --partitions 3 --replication-factor 1 \
-        --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic orders.retry.5m --partitions 3 --replication-factor 1 \
-        --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic orders.dlq --partitions 1 --replication-factor 1 \
-        --config retention.ms=-1
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic orders.aggregate.state --partitions 3 --replication-factor 1 \
-        --config cleanup.policy=compact
-      echo "--- topics present ---"
-      kafka-topics --bootstrap-server kafka:29092 --list
+    # `command` MUST be a single-element list, not a bare block scalar. Compose
+    # splits a plain string on whitespace, so `bash -c` would receive only the
+    # first word as its script and the rest as positional parameters — the
+    # container then exits 0 having created nothing, and the whole stack looks
+    # healthy with no topics on it. Keep the `- |`.
+    command:
+      - |
+        set -euo pipefail
+        echo "--- creating topics ---"
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic orders --partitions 3 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic orders.retry.5s --partitions 3 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic orders.retry.30s --partitions 3 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic orders.retry.5m --partitions 3 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic orders.dlq --partitions 1 --replication-factor 1 \
+          --config retention.ms=-1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic orders.aggregate.state --partitions 3 --replication-factor 1 \
+          --config cleanup.policy=compact
+        echo "--- topics present ---"
+        kafka-topics --bootstrap-server kafka:29092 --list
     restart: 'no'
 
   schema-registry:

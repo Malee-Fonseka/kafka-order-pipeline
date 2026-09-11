@@ -11,6 +11,7 @@ import {
   ensureOrderSchemaRegistered,
   isClassifiedError,
   loadConfig,
+  readPackageVersion,
 } from '@order-pipeline/shared';
 
 import { createAggregator } from './aggregation/aggregator.js';
@@ -19,6 +20,7 @@ import { createMetrics } from './api/metrics.js';
 import { type HealthReport, createApiServer } from './api/server.js';
 import { createStatsSampler, createThroughput } from './api/stats.js';
 import { consumerEnvSchema } from './config.js';
+import { createDlqWriter } from './dlq/writer.js';
 import { createOrderHandler } from './handler.js';
 import { createOrderConsumer } from './kafka.js';
 import { type IncomingRecord, createPipeline } from './pipeline.js';
@@ -38,6 +40,7 @@ const logger = createLogger({
 const topics = buildTopicRegistry(config.TOPIC_PREFIX);
 const shutdown = createShutdownManager({ logger });
 const instanceId = `${hostname()}-${String(process.pid)}`;
+const appVersion = readPackageVersion(import.meta.url);
 
 async function main(): Promise<void> {
   logger.info(
@@ -48,6 +51,8 @@ async function main(): Promise<void> {
       groupId: config.CONSUMER_GROUP_ID,
       sourceTopic: topics.orders,
       retryTopics: topics.retryTiers.map((t) => t.topic),
+      dlqTopic: topics.dlq,
+      appVersion,
       stateTopic: topics.aggregateState,
       inPlaceRetry: {
         attempts: config.CONSUMER_RETRY_INPLACE_ATTEMPTS,
@@ -106,20 +111,33 @@ async function main(): Promise<void> {
   const throughput = createThroughput();
   const tally: Record<Outcome['kind'], number> = {
     processed: 0,
-    skipped: 0,
     retried: 0,
-    exhausted: 0,
+    'dead-lettered': 0,
     forwarded: 0,
   };
 
   // Retry machinery (D5). One producer serves both the changelog and the
   // retry republisher; both need the D2 guarantees and neither is hot.
-  const retryProducer = await createIdempotentProducer({ kafka, logger, purpose: 'retry-tiers' });
+  const retryProducer = await createIdempotentProducer({
+    kafka,
+    logger,
+    purpose: 'retry-tiers-and-dlq',
+  });
   shutdown.register('retry-producer', async () => {
     await retryProducer.flush({ timeout: 5_000 });
     await retryProducer.disconnect();
   });
   const publisher = createRetryPublisher({ producer: retryProducer, topics, logger });
+
+  // The dead letter writer (D6) shares the same producer: it writes raw
+  // bytes to a topic that never expires, with the failure in headers.
+  const dlq = createDlqWriter({
+    producer: retryProducer,
+    topic: topics.dlq,
+    consumerGroup: config.CONSUMER_GROUP_ID,
+    appVersion,
+    logger,
+  });
   const delayGate = createDelayGate({ logger });
   shutdown.register('retry-delay-gate', () => {
     delayGate.close();
@@ -141,7 +159,14 @@ async function main(): Promise<void> {
       throughput.mark();
     },
   });
-  const processOrder = createRecordProcessor({ deserializer, handler, publisher, backoff, logger });
+  const processOrder = createRecordProcessor({
+    deserializer,
+    handler,
+    publisher,
+    dlq,
+    backoff,
+    logger,
+  });
 
   // The message path for a retry tier that is due: forward back to orders.
   const processRetry = createForwardProcessor({ publisher });
@@ -173,7 +198,7 @@ async function main(): Promise<void> {
     throughput,
     counters: () => ({
       processed: tally.processed,
-      skipped: tally.skipped + tally.exhausted,
+      deadLettered: tally['dead-lettered'],
       retried: tally.retried,
       forwarded: tally.forwarded,
       committed: pipeline.stats.committed,

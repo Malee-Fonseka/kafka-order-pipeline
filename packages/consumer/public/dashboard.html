@@ -268,7 +268,8 @@
           <div class="label">Processed</div>
           <div class="value" id="processed">0</div>
           <div class="sub">
-            <span id="skipped">0</span> skipped · <span id="committed">0</span> committed
+            <span id="dead-lettered">0</span> dead-lettered ·
+            <span id="committed">0</span> committed
           </div>
         </div>
       </div>
@@ -422,7 +423,7 @@
             if (el) el.textContent = whole.format(tier.depth);
           });
           text('processed', whole.format(s.counters.processed));
-          text('skipped', whole.format(s.counters.skipped));
+          text('dead-lettered', whole.format(s.counters.deadLettered));
           text('committed', whole.format(s.counters.committed));
           text(
             'sampled',

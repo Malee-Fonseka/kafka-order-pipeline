@@ -30,7 +30,8 @@
     "infra:up": "docker compose up -d",
     "infra:down": "docker compose down",
     "infra:reset": "docker compose down -v && docker compose up -d",
-    "infra:logs": "docker compose logs -f"
+    "infra:logs": "docker compose logs -f",
+    "dlq": "node --env-file=.env packages/dlq-tools/dist/index.js"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",

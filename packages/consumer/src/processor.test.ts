@@ -2,18 +2,22 @@ import { MockClient, type Client } from '@confluentinc/schemaregistry';
 import {
   ATTEMPT_COUNT_HEADER,
   CORRELATION_ID_HEADER,
+  type ClassifiedError,
   type Order,
   type OrderDeserializer,
+  type PermanentError,
   TransientError,
   buildTopicRegistry,
   createOrderDeserializer,
   createOrderSerializer,
   encodeHeaders,
   encodeWireFormatHeader,
+  dlqErrorTypeFor,
   ensureOrderSchemaRegistered,
 } from '@order-pipeline/shared';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
+import type { DlqWriter } from './dlq/writer.js';
 import type { OrderHandler } from './handler.js';
 import type { IncomingRecord } from './pipeline.js';
 import { createForwardProcessor, createRecordProcessor } from './processor.js';
@@ -65,6 +69,7 @@ function fakePublisher(): RetryPublisher & {
       originalTopic: undefined,
       originalPartition: undefined,
       originalOffset: undefined,
+      originalTimestamp: undefined,
     }),
   };
 }
@@ -82,6 +87,14 @@ function recordWith(value: Buffer | null, headers?: Record<string, Buffer>): Inc
 }
 
 const okHandler: OrderHandler = async () => Promise.resolve();
+
+function fakeDlq(): DlqWriter & { write: ReturnType<typeof vi.fn> } {
+  return {
+    write: vi.fn(async (_record: IncomingRecord, error: ClassifiedError, _attempt: number) =>
+      Promise.resolve({ errorType: dlqErrorTypeFor(error), partition: 0, offset: '9' }),
+    ),
+  };
+}
 
 /** `expect.objectContaining` is typed `any`; this keeps the call sites lint-clean. */
 function containing(shape: Record<string, unknown>): unknown {
@@ -107,6 +120,7 @@ describe('record processor', () => {
       deserializer,
       handler,
       publisher: fakePublisher(),
+      dlq: fakeDlq(),
       backoff,
       logger,
     });
@@ -129,6 +143,7 @@ describe('record processor', () => {
       deserializer,
       handler: okHandler,
       publisher: fakePublisher(),
+      dlq: fakeDlq(),
       backoff,
       logger: fakeLogger(),
     });
@@ -156,6 +171,7 @@ describe('record processor', () => {
       deserializer,
       handler,
       publisher,
+      dlq: fakeDlq(),
       backoff,
       logger: fakeLogger(),
     });
@@ -176,6 +192,7 @@ describe('record processor', () => {
       deserializer,
       handler,
       publisher,
+      dlq: fakeDlq(),
       backoff,
       logger: fakeLogger(),
     });
@@ -190,27 +207,33 @@ describe('record processor', () => {
     );
   });
 
-  it('reports exhaustion as a terminal outcome when no tier is left', async () => {
+  it('dead-letters as transient-exhausted when no tier is left', async () => {
     const handler: OrderHandler = async () => {
       await Promise.resolve();
       throw new TransientError('still down');
     };
     const publisher = fakePublisher();
-    publisher.escalate.mockResolvedValue({
-      kind: 'exhausted',
-      attempt: 4,
-      error: new TransientError('still down'),
+    const stillDown = new TransientError('still down');
+    publisher.escalate.mockResolvedValue({ kind: 'exhausted', attempt: 4, error: stillDown });
+    const dlq = fakeDlq();
+    const process = createRecordProcessor({
+      deserializer,
+      handler,
+      publisher,
+      dlq,
+      backoff,
+      logger: fakeLogger(),
     });
-    const logger = fakeLogger();
-    const process = createRecordProcessor({ deserializer, handler, publisher, backoff, logger });
 
     const outcome = await process(recordWith(validPayload));
 
-    expect(outcome).toMatchObject({ kind: 'exhausted', attempt: 4 });
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringMatching(/tiers exhausted/),
-    );
+    expect(outcome).toMatchObject({
+      kind: 'dead-lettered',
+      errorType: 'transient-exhausted',
+      attempt: 4,
+      dlqOffset: '9',
+    });
+    expect(dlq.write).toHaveBeenCalledWith(expect.objectContaining({ offset: '42' }), stillDown, 4);
   });
 
   it.each([
@@ -226,28 +249,34 @@ describe('record processor', () => {
       value: encodeWireFormatHeader(999_999, Buffer.from([0x02, 0x41])),
       reason: 'unknown-schema-id',
     },
-  ])('skips $label without retrying, in place or via tiers', async ({ value, reason }) => {
-    // Retrying a poison pill is the §2.3 livelock: no in-place attempts, no
-    // republish. Straight to a terminal outcome.
-    const handler = vi.fn(okHandler);
-    const publisher = fakePublisher();
-    const process = createRecordProcessor({
-      deserializer,
-      handler,
-      publisher,
-      backoff,
-      logger: fakeLogger(),
-    });
+  ])(
+    'dead-letters $label as permanent without retrying, in place or via tiers',
+    async ({ value, reason }) => {
+      // Retrying a poison pill is the §2.3 livelock: no in-place attempts, no
+      // republish. Straight to the DLQ, on the first delivery.
+      const handler = vi.fn(okHandler);
+      const publisher = fakePublisher();
+      const dlq = fakeDlq();
+      const process = createRecordProcessor({
+        deserializer,
+        handler,
+        publisher,
+        dlq,
+        backoff,
+        logger: fakeLogger(),
+      });
 
-    const outcome = await process(recordWith(value));
+      const outcome = await process(recordWith(value));
 
-    expect(outcome.kind).toBe('skipped');
-    if (outcome.kind === 'skipped') {
-      expect(outcome.error.reason).toBe(reason);
-    }
-    expect(handler).not.toHaveBeenCalled();
-    expect(publisher.escalate).not.toHaveBeenCalled();
-  });
+      expect(outcome).toMatchObject({ kind: 'dead-lettered', errorType: 'permanent', attempt: 1 });
+      if (outcome.kind === 'dead-lettered') {
+        expect((outcome.error as PermanentError).reason).toBe(reason);
+      }
+      expect(handler).not.toHaveBeenCalled();
+      expect(publisher.escalate).not.toHaveBeenCalled();
+      expect(dlq.write).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('treats a permanent handler failure as terminal immediately', async () => {
     const handler: OrderHandler = async () => {
@@ -259,14 +288,19 @@ describe('record processor', () => {
       deserializer,
       handler,
       publisher,
+      dlq: fakeDlq(),
       backoff,
       logger: fakeLogger(),
     });
 
     const outcome = await process(recordWith(validPayload));
 
-    // Unclassified → permanent 'unclassified' → skipped, one attempt, no tiers.
-    expect(outcome).toMatchObject({ kind: 'skipped', error: { reason: 'unclassified' } });
+    // Unclassified → permanent 'unclassified' → DLQ, one attempt, no tiers.
+    expect(outcome).toMatchObject({
+      kind: 'dead-lettered',
+      errorType: 'permanent',
+      error: { reason: 'unclassified' },
+    });
     expect(publisher.escalate).not.toHaveBeenCalled();
   });
 
@@ -283,11 +317,31 @@ describe('record processor', () => {
       deserializer,
       handler,
       publisher,
+      dlq: fakeDlq(),
       backoff,
       logger: fakeLogger(),
     });
 
     await expect(process(recordWith(validPayload))).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it('propagates a failed DLQ write so the pipeline does not commit', async () => {
+    // D7 clause (c): the offset commits only after the DLQ write succeeds.
+    // A broker that refuses the write leaves nothing durable, so redeliver.
+    const dlq = fakeDlq();
+    dlq.write.mockRejectedValue(new TransientError('dead letter write failed: broker away'));
+    const process = createRecordProcessor({
+      deserializer,
+      handler: okHandler,
+      publisher: fakePublisher(),
+      dlq,
+      backoff,
+      logger: fakeLogger(),
+    });
+
+    await expect(process(recordWith(Buffer.from('{"not":"avro"}')))).rejects.toBeInstanceOf(
+      TransientError,
+    );
   });
 
   it('uses the original partition from headers as the aggregation source', async () => {
@@ -298,6 +352,7 @@ describe('record processor', () => {
       deserializer,
       handler,
       publisher: fakePublisher(),
+      dlq: fakeDlq(),
       backoff,
       logger: fakeLogger(),
     });

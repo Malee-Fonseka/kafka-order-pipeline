@@ -4,6 +4,7 @@ import {
   LAST_FAILED_AT_HEADER,
   ORIGINAL_OFFSET_HEADER,
   ORIGINAL_PARTITION_HEADER,
+  ORIGINAL_TIMESTAMP_HEADER,
   ORIGINAL_TOPIC_HEADER,
   RETRY_NOT_BEFORE_HEADER,
   readHeader,
@@ -36,6 +37,8 @@ export interface RetryMetadata {
   readonly originalTopic: string | undefined;
   readonly originalPartition: number | undefined;
   readonly originalOffset: string | undefined;
+  /** Broker timestamp of the original record, epoch ms. */
+  readonly originalTimestamp: number | undefined;
 }
 
 export function readRetryMetadata(
@@ -49,6 +52,7 @@ export function readRetryMetadata(
     originalTopic: readHeader(headers, ORIGINAL_TOPIC_HEADER),
     originalPartition: readIntHeader(headers, ORIGINAL_PARTITION_HEADER),
     originalOffset: readHeader(headers, ORIGINAL_OFFSET_HEADER),
+    originalTimestamp: readIntHeader(headers, ORIGINAL_TIMESTAMP_HEADER),
   };
 }
 
@@ -77,7 +81,12 @@ export interface RetryHeaderUpdate {
   readonly now: Date;
   readonly existing: RetryMetadata;
   /** The record's current location, recorded as the origin on the first hop only. */
-  readonly source: { readonly topic: string; readonly partition: number; readonly offset: string };
+  readonly source: {
+    readonly topic: string;
+    readonly partition: number;
+    readonly offset: string;
+    readonly timestamp: number;
+  };
 }
 
 /** The header values to set when republishing to a retry tier. */
@@ -97,5 +106,6 @@ export function retryHeaderValues({
     [ORIGINAL_TOPIC_HEADER]: existing.originalTopic ?? source.topic,
     [ORIGINAL_PARTITION_HEADER]: existing.originalPartition ?? source.partition,
     [ORIGINAL_OFFSET_HEADER]: existing.originalOffset ?? source.offset,
+    [ORIGINAL_TIMESTAMP_HEADER]: existing.originalTimestamp ?? source.timestamp,
   };
 }

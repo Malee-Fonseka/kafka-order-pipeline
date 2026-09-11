@@ -31,7 +31,7 @@ export interface RuntimeStats {
   readonly throughputPerSecond: number;
   readonly counters: {
     readonly processed: number;
-    readonly skipped: number;
+    readonly deadLettered: number;
     readonly retried: number;
     readonly forwarded: number;
     readonly committed: number;

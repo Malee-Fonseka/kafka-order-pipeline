@@ -1,14 +1,11 @@
-import { randomUUID } from 'node:crypto';
-
 import {
   type KafkaClient,
   type Logger,
   type Producer,
   TransientError,
   createIdempotentProducer,
-  createKafkaLogger,
   describeError,
-  toKafkaLogLevel,
+  scanTopic,
 } from '@order-pipeline/shared';
 import { z } from 'zod';
 
@@ -129,130 +126,51 @@ export async function createStateStore({
 
     async restore(partitions) {
       const wanted = new Set(partitions);
-      const started = Date.now();
-
-      // 1. Where does the topic end right now? Anything written after this
-      //    point is a live update we will receive through the normal path.
-      const admin = kafka.admin();
-      await admin.connect();
-      let goals: Map<number, bigint>;
-      try {
-        const watermarks = await admin.fetchTopicOffsets(topic);
-        goals = new Map(
-          watermarks
-            .filter((w) => BigInt(w.high) > BigInt(w.low))
-            .map((w) => [w.partition, BigInt(w.high) - 1n]),
-        );
-      } finally {
-        await admin.disconnect();
-      }
-
-      if (goals.size === 0) {
-        logger.info({ topic, partitions }, 'changelog is empty; nothing to restore');
-        return [];
-      }
-
-      // 2. Read every non-empty changelog partition up to that end. A unique
-      //    group id gives this reader all partitions and keeps its offsets
-      //    separate from the real consumer group's; it is deleted afterwards.
-      const restoreGroupId = `${groupId}-restore-${randomUUID()}`;
-      const reader = kafka.consumer({
-        kafkaJS: {
-          groupId: restoreGroupId,
-          fromBeginning: true,
-          autoCommit: false,
-          allowAutoTopicCreation: false,
-          logger: createKafkaLogger(logger),
-          logLevel: toKafkaLogLevel(logger.level),
-        },
-      });
-
       const latest = new Map<string, ProductEntry>();
-      const reached = new Map<number, bigint>();
-      let scanned = 0;
       let skipped = 0;
 
-      const complete = (): boolean =>
-        [...goals].every(([partition, goal]) => (reached.get(partition) ?? -1n) >= goal);
-
-      let resolveDone: () => void = () => undefined;
-      const done = new Promise<void>((resolve) => {
-        resolveDone = resolve;
-      });
-
-      await reader.connect();
-      try {
-        await reader.subscribe({ topics: [topic] });
-        await reader.run({
-          eachMessage: async ({ partition, message }) => {
-            await Promise.resolve();
-            scanned += 1;
-            reached.set(partition, BigInt(message.offset));
-
-            if (message.value !== null) {
-              try {
-                const entry = decodeEntry(message.value);
-                // Later offsets win: compaction may not have run yet, so a
-                // product can appear many times. Filter by *orders* partition,
-                // which is recorded in the entry — not by changelog partition.
-                if (wanted.has(entry.partition)) {
-                  latest.set(entry.product, entry);
-                }
-              } catch (error) {
-                skipped += 1;
-                logger.warn(
-                  { topic, partition, offset: message.offset, err: error },
-                  'skipping undecodable changelog record',
-                );
-              }
+      const result = await scanTopic({
+        kafka,
+        topic,
+        groupIdPrefix: `${groupId}-restore`,
+        logger,
+        timeoutMs: restoreTimeoutMs,
+        onRecord: (record) => {
+          if (record.value === null) {
+            return;
+          }
+          try {
+            const entry = decodeEntry(record.value);
+            // Later offsets win: compaction may not have run yet, so a product
+            // can appear many times. Filter by *orders* partition, which is
+            // recorded in the entry — not by changelog partition.
+            if (wanted.has(entry.partition)) {
+              latest.set(entry.product, entry);
             }
-
-            if (complete()) {
-              resolveDone();
-            }
-          },
-        });
-
-        const timeout = new Promise<never>((_, reject) => {
-          setTimeout(() => {
-            reject(
-              new Error(
-                `changelog restore timed out after ${String(restoreTimeoutMs)}ms; ` +
-                  `reached ${JSON.stringify([...reached].map(([p, o]) => [p, o.toString()]))} ` +
-                  `of ${JSON.stringify([...goals].map(([p, o]) => [p, o.toString()]))}`,
-              ),
+          } catch (error) {
+            skipped += 1;
+            logger.warn(
+              { topic, partition: record.partition, offset: record.offset, err: error },
+              'skipping undecodable changelog record',
             );
-          }, restoreTimeoutMs).unref();
-        });
-
-        await Promise.race([done, timeout]);
-      } finally {
-        await reader.disconnect();
-        // Best effort: an orphaned restore group is harmless (no commits, expires
-        // on its own) but clutters the group list in Kafbat UI.
-        const admin2 = kafka.admin();
-        try {
-          await admin2.connect();
-          await admin2.deleteGroups([restoreGroupId]);
-        } catch (error) {
-          logger.debug({ restoreGroupId, err: error }, 'could not delete restore group');
-        } finally {
-          await admin2.disconnect();
-        }
-      }
+          }
+        },
+      });
 
       const entries = [...latest.values()];
       logger.info(
         {
           topic,
           partitions,
-          scanned,
+          scanned: result.scanned,
           skipped,
           restored: entries.length,
           products: entries.map((e) => e.product).sort(),
-          elapsedMs: Date.now() - started,
+          elapsedMs: result.elapsedMs,
         },
-        'aggregation state restored from changelog',
+        result.scanned === 0
+          ? 'changelog is empty; nothing to restore'
+          : 'aggregation state restored from changelog',
       );
       return entries;
     },

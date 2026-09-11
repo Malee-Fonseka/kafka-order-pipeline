@@ -1,16 +1,17 @@
 import {
   CORRELATION_ID_HEADER,
   type ClassifiedError,
+  type DlqErrorType,
   type Logger,
   type Order,
   type OrderDeserializer,
-  type PermanentError,
   type RetryTier,
   isPermanent,
   readHeader,
   readRetryMetadata,
 } from '@order-pipeline/shared';
 
+import type { DlqWriter } from './dlq/writer.js';
 import type { OrderHandler } from './handler.js';
 import type { IncomingRecord } from './pipeline.js';
 import { type BackoffOptions, InPlaceRetryExhausted, retryInPlace } from './retry/backoff.js';
@@ -25,18 +26,18 @@ import type { RetryPublisher } from './retry/publisher.js';
  *                                                       still transient
  *                                                                   │
  *                        stage 2: republish to tier by attempt count ┼─ tier ──▶ retried
- *                                                                   └─ none ──▶ exhausted
- *   permanent at any point ────────────────────────────────────────────────▶ skipped
+ *                                                                   └─ none ──▶ dead-lettered (transient-exhausted)
+ *   permanent at any point ──────────────────────────────────────────────▶ dead-lettered (permanent)
  *
  * Every variant returned here is **terminal** — the pipeline commits on any
- * resolved outcome (D7) — so each must mean the record's fate is recorded
- * somewhere durable: in the aggregate, on a retry topic, or (Phase 7) in the
- * DLQ. `skipped` and `exhausted` are the two Phase 7 replaces with DLQ writes;
- * until then they are counted and logged at `warn`.
+ * resolved outcome (D7) — so each means the record's fate is recorded
+ * somewhere durable: in the aggregate, on a retry topic, or in the DLQ with
+ * its raw bytes and forensic headers (D6).
  *
- * Only a failure of the *republish itself* escapes as a throw: that is a
- * broker problem, nothing durable has happened, and the pipeline must not
- * commit — the client redelivers.
+ * Only a failure of a *write to another topic* — the retry republish or the
+ * DLQ write itself — escapes as a throw: that is a broker problem, nothing
+ * durable has happened, and the pipeline must not commit. The client
+ * redelivers.
  */
 
 export type Outcome =
@@ -48,11 +49,6 @@ export type Outcome =
       readonly attempts: number;
     }
   | {
-      readonly kind: 'skipped';
-      readonly error: PermanentError;
-      readonly correlationId: string | undefined;
-    }
-  | {
       readonly kind: 'retried';
       readonly tier: RetryTier;
       readonly attempt: number;
@@ -60,9 +56,11 @@ export type Outcome =
       readonly correlationId: string | undefined;
     }
   | {
-      readonly kind: 'exhausted';
-      readonly attempt: number;
+      readonly kind: 'dead-lettered';
+      readonly errorType: DlqErrorType;
       readonly error: ClassifiedError;
+      readonly attempt: number;
+      readonly dlqOffset: string | undefined;
       readonly correlationId: string | undefined;
     }
   | {
@@ -76,6 +74,7 @@ export interface ProcessorOptions {
   readonly deserializer: OrderDeserializer;
   readonly handler: OrderHandler;
   readonly publisher: RetryPublisher;
+  readonly dlq: DlqWriter;
   readonly backoff: BackoffOptions;
   readonly logger: Logger;
 }
@@ -86,6 +85,7 @@ export function createRecordProcessor({
   deserializer,
   handler,
   publisher,
+  dlq,
   backoff,
   logger,
 }: ProcessorOptions): RecordProcessor {
@@ -121,11 +121,17 @@ export function createRecordProcessor({
       }, backoff);
     } catch (error) {
       if (isPermanent(error)) {
-        logger.warn(
-          { ...location, reason: error.reason, err: error },
-          'record cannot be processed; skipping until the DLQ writer lands in phase 7',
-        );
-        return { kind: 'skipped', error, correlationId };
+        // Straight to the DLQ: no in-place attempt was retried and no tier
+        // is involved. The attempt count is the deliveries so far.
+        const written = await dlq.write(record, error, delivery);
+        return {
+          kind: 'dead-lettered',
+          errorType: written.errorType,
+          error,
+          attempt: delivery,
+          dlqOffset: written.offset,
+          correlationId,
+        };
       }
 
       if (error instanceof InPlaceRetryExhausted) {
@@ -150,16 +156,24 @@ export function createRecordProcessor({
             correlationId,
           };
         }
-        logger.warn(
-          { ...location, attempt: outcome.attempt, err: outcome.error },
-          'retry tiers exhausted; skipping until the DLQ writer lands in phase 7',
-        );
-        return { kind: 'exhausted', attempt: outcome.attempt, error: outcome.error, correlationId };
+        // Out of tiers: the transient failure is now, for our purposes,
+        // permanent. The DLQ records it as transient-exhausted so the
+        // inspector can tell "never decodable" from "downstream was down".
+        const written = await dlq.write(record, outcome.error, outcome.attempt);
+        return {
+          kind: 'dead-lettered',
+          errorType: written.errorType,
+          error: outcome.error,
+          attempt: outcome.attempt,
+          dlqOffset: written.offset,
+          correlationId,
+        };
       }
 
-      // A transient error from the republish path itself — the broker refused
-      // the retry-topic write. Nothing durable has happened, so this is not
-      // terminal: propagate, the pipeline will not commit, the client redelivers.
+      // A transient error from a write to another topic — the broker refused
+      // the retry-topic or DLQ write. Nothing durable has happened, so this is
+      // not terminal: propagate, the pipeline will not commit, the client
+      // redelivers.
       throw error;
     }
 

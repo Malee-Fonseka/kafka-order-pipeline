@@ -120,3 +120,24 @@ export {
   type RetryHeaderUpdate,
   type RetryMetadata,
 } from './retry.js';
+export { scanTopic, type ScanResult, type ScanTopicOptions, type ScannedRecord } from './kafka.js';
+
+// --- Phase 7: dead letter queue ---
+
+export {
+  HEADERS_STRIPPED_ON_REPLAY,
+  MAX_STACK_HEADER_BYTES,
+  REPLAYED_AT_HEADER,
+  REPLAYED_FROM_OFFSET_HEADER,
+  REPLAY_COUNT_HEADER,
+  dlqErrorTypeFor,
+  dlqHeaderValues,
+  readDlqMetadata,
+  replayHeaders,
+  type DlqErrorType,
+  type DlqFailure,
+  type DlqMetadata,
+  type DlqSource,
+  type DlqWriterContext,
+  type ReplaySource,
+} from './dlq.js';

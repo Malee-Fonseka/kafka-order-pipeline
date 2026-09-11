@@ -135,7 +135,12 @@ export function createRetryPublisher({
             notBefore: notBefore.getTime(),
             now: at,
             existing,
-            source: { topic: record.topic, partition: record.partition, offset: record.offset },
+            source: {
+              topic: record.topic,
+              partition: record.partition,
+              offset: record.offset,
+              timestamp: Number(record.timestamp),
+            },
           }),
         ),
       };

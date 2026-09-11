@@ -14,7 +14,7 @@ import type { RuntimeStats } from './stats.js';
 
 export interface Metrics {
   readonly registry: Registry;
-  recordOutcome: (outcome: 'processed' | 'skipped' | 'retried' | 'exhausted' | 'forwarded') => void;
+  recordOutcome: (outcome: 'processed' | 'retried' | 'dead-lettered' | 'forwarded') => void;
   recordCommit: () => void;
   recordFailure: () => void;
   recordAggregate: (entry: ProductEntry) => void;
@@ -30,7 +30,7 @@ export function createMetrics(): Metrics {
 
   const consumed = new Counter({
     name: 'orders_consumed_total',
-    help: 'Records consumed, by terminal outcome (processed, skipped, retried, exhausted, forwarded).',
+    help: 'Records consumed, by terminal outcome (processed, retried, dead-lettered, forwarded).',
     labelNames: ['outcome'] as const,
     registers: [registry],
   });
